@@ -21,6 +21,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# SP_AUTH_MODE=integrated: authenticate as the current process identity, so no
+# password ever enters the process. Platform-specific, hence optional.
+windows = ["requests-negotiate-sspi>=0.5; sys_platform == 'win32'"]
+kerberos = ["requests-gssapi>=1.2.3"]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",

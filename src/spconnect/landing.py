@@ -68,7 +68,7 @@ def write_json_atomic(path: Path, payload: Any) -> None:
 #: row with the ``ows_`` prefix already stripped. Accept both spellings so the
 #: two files stay in lockstep during truncation and delete.
 DECODED_ID_KEYS = ("item_id",)
-RAW_ID_KEYS = ("ID", "ows_ID")
+RAW_ID_KEYS = ("ID", "ows_ID", "Id")
 
 
 def _dump(model: Any) -> Any:

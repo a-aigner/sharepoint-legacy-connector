@@ -330,6 +330,47 @@ def decode_fsobjtype(value: str | None) -> int | None:
         return None
 
 
+_TERM_GUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def _split_term(value: str | None) -> tuple[str | None, str | None]:
+    """``'Reparatur|9f8e7d6c-…'`` -> ``('Reparatur', '9f8e7d6c-…')``.
+
+    Falls back to ``(value, None)`` when the tail is not a GUID, so a label that
+    happens to contain a pipe is preserved rather than mangled.
+    """
+    if not value or "|" not in value:
+        return value, None
+    label, _, candidate = value.rpartition("|")
+    candidate = candidate.strip()
+    if _TERM_GUID_RE.match(candidate):
+        return label, candidate.lower()
+    return value, None
+
+
+def decode_taxonomy(value: str, ctx: DecodeContext = _NULL_CONTEXT) -> dict[str, Any] | None:
+    """``TaxonomyFieldType`` (Managed Metadata, new in SharePoint 2010).
+
+    Wire form is a lookup into the hidden taxonomy list whose display value is
+    ``Label|TermGuid``: ``3;#Reparatur|9f8e7d6c-…``. The **term GUID** is the
+    durable identity — labels are language-specific and get renamed.
+    """
+    pair = decode_lookup(value, ctx)
+    if pair is None:
+        return None
+    label, term_guid = _split_term(pair.get("value"))
+    return {"id": pair["id"], "value": label, "term_guid": term_guid}
+
+
+def decode_taxonomy_multi(value: str, ctx: DecodeContext = _NULL_CONTEXT) -> list[dict[str, Any]]:
+    """``TaxonomyFieldTypeMulti`` — the same encoding, repeated."""
+    results = []
+    for pair in decode_lookup_multi(value, ctx):
+        label, term_guid = _split_term(pair.get("value"))
+        results.append({"id": pair["id"], "value": label, "term_guid": term_guid})
+    return results
+
+
 _CALCULATED_DECODERS: dict[str, Callable[[str, DecodeContext], Any]] = {
     "float": decode_number,
     "number": decode_number,
@@ -401,6 +442,13 @@ _SIMPLE_DECODERS: dict[str, Callable[[str, DecodeContext], Any]] = {
     "User": decode_user,
     "UserMulti": decode_user_multi,
     "URL": decode_url,
+    # SharePoint 2010 additions.
+    "TaxonomyFieldType": decode_taxonomy,
+    "TaxonomyFieldTypeMulti": decode_taxonomy_multi,
+    "RatingCount": decode_int,
+    "AverageRating": decode_number,
+    "Likes": decode_int,
+    "ModStat": decode_int,
 }
 
 
@@ -501,11 +549,17 @@ def json_default(value: Any) -> Any:
 _INT_RE = re.compile(r"^-?\d+$")
 
 
-def coerce_item_id(raw: dict[str, str]) -> int | None:
-    """Pull a usable integer item id out of a raw row."""
-    value = raw.get("ows_ID")
+def coerce_item_id(raw: dict[str, Any]) -> int | None:
+    """Pull a usable integer item id out of a raw row.
+
+    Handles the SOAP spelling (``ows_ID``) and the OData one (``Id``), so the
+    landing zone stays identical whichever backend produced the row.
+    """
+    value = next((raw[k] for k in ("ows_ID", "ID", "Id") if raw.get(k) is not None), None)
     if value is None:
         return None
+    if isinstance(value, int):
+        return value
     text = str(value).strip()
     if _INT_RE.match(text):
         return int(text)

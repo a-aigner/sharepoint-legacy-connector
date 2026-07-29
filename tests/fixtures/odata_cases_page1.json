@@ -1,0 +1,38 @@
+{"d": {"results": [
+  {
+    "__metadata": {"uri": "http://sp/sites/service/_vti_bin/ListData.svc/Servicef%C3%A4lle(1)", "etag": "W/\"9\"", "type": "Microsoft.SharePoint.DataService.ServicefälleItem"},
+    "Id": 1,
+    "Title": "Getriebeschaden",
+    "CaseNumber": "SF-2009-0001",
+    "Kunde": {"__metadata": {"uri": "x"}, "Id": 42, "Title": "Müller Maschinenbau GmbH"},
+    "KundeId": 42,
+    "Kategorie": {"results": ["Reparatur", "Garantie"]},
+    "Beschreibung": "<div>Kunde meldet <b>lautes</b> Geräusch &amp; starke Vibration.</div>",
+    "Kosten": "1234.5000000000000",
+    "Erledigt": true,
+    "Eingegangen": "/Date(1237018260000)/",
+    "Prioritaet": "Hoch",
+    "Meldungen": 3,
+    "Created": "/Date(1237018260000)/",
+    "Modified": "/Date(1309621380000)/",
+    "Attachments": {"__deferred": {"uri": "x/Attachments"}}
+  },
+  {
+    "__metadata": {"uri": "http://sp/sites/service/_vti_bin/ListData.svc/Servicef%C3%A4lle(2)", "type": "Microsoft.SharePoint.DataService.ServicefälleItem"},
+    "Id": 2,
+    "Title": "Ölwechsel überfällig",
+    "CaseNumber": "SF-2010-0042",
+    "Kunde": {"__metadata": {"uri": "x"}, "Id": 57, "Title": "Beta AG"},
+    "KundeId": 57,
+    "Kategorie": {"results": ["Wartung"]},
+    "Beschreibung": "Routineprüfung, keine Auffälligkeiten.",
+    "Kosten": "0.0000000000000",
+    "Erledigt": false,
+    "Eingegangen": "/Date(1288690200000)/",
+    "Prioritaet": "Niedrig",
+    "Meldungen": null,
+    "Created": "/Date(1288690200000)/",
+    "Modified": "/Date(1288690260000)/",
+    "Attachments": {"__deferred": {"uri": "x/Attachments"}}
+  }
+], "__next": "http://sp/sites/service/_vti_bin/ListData.svc/Servicef%C3%A4lle?$skiptoken=2"}}

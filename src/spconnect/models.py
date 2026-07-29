@@ -237,6 +237,8 @@ class Manifest(BaseModel):
     finished_at: datetime | None = None
     base_url: str = ""
     server_version: dict[str, Any] = Field(default_factory=dict)
+    web_discovery_method: str = "GetAllSubWebCollection"
+    api_mode: str = "soap"
     config: dict[str, Any] = Field(default_factory=dict)
     counts: dict[str, int] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)

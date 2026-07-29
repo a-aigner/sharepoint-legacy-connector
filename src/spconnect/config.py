@@ -9,19 +9,84 @@ The CLI layer implements the first level by calling :func:`load_settings` with
 
 from __future__ import annotations
 
+import base64
 import logging
 import sys
+from collections.abc import Mapping, MutableMapping
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import quote
 
 import structlog
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-AuthMode = Literal["ntlm", "basic", "anonymous"]
+#: ``integrated`` uses the *current process identity* (Windows SSPI or a
+#: Kerberos ticket) and needs no password at all — the strongest option, because
+#: a secret that never enters the process cannot leak from it.
+AuthMode = Literal["integrated", "ntlm", "basic", "anonymous"]
+ApiMode = Literal["soap", "odata"]
 LogFormat = Literal["console", "json"]
 
 REDACTED = "***REDACTED***"
+
+#: Secrets registered at runtime so the log pipeline can scrub them from *any*
+#: event, including request/response bodies. Belt and braces: the acceptance
+#: criterion is that SP_PASSWORD appears nowhere in logs, and relying on every
+#: future call site to remember that is not a control.
+_SECRETS: set[str] = set()
+
+
+def register_secret(value: str | None, *, username: str | None = None) -> None:
+    """Register a value — and its common encodings — for scrubbing.
+
+    A plain substring match misses the encoded forms a credential actually
+    travels in, so the derived variants are registered too. Notably the Basic
+    auth blob: ``base64("user:pass")`` contains no verbatim password at all.
+    """
+    if not value or len(value) < 3:
+        return
+    _SECRETS.add(value)
+    _SECRETS.add(quote(value, safe=""))
+    _SECRETS.add(base64.b64encode(value.encode()).decode())
+    for user in filter(None, (username,)):
+        for pair in (f"{user}:{value}",):
+            _SECRETS.add(base64.b64encode(pair.encode()).decode())
+            _SECRETS.add(quote(pair, safe=""))
+    _SECRETS.discard("")
+
+
+def scrub(text: str) -> str:
+    """Replace registered secrets, **longest first**.
+
+    Order matters: base64 encoding aligns on 3-byte boundaries, so
+    ``b64("user:pass")`` can literally contain ``b64("pass")``. Replacing the
+    short one first fragments the long one and leaves partial credential
+    material in the log.
+    """
+    for secret in sorted(_SECRETS, key=len, reverse=True):
+        if secret in text:
+            text = text.replace(secret, REDACTED)
+    return text
+
+
+def scrub_value(value: Any) -> Any:
+    """Scrub recursively. A secret nested in a dict is still a leaked secret."""
+    if isinstance(value, str):
+        return scrub(value)
+    if isinstance(value, Mapping):
+        return {k: scrub_value(v) for k, v in value.items()}
+    if isinstance(value, list | tuple | set):
+        return type(value)(scrub_value(v) for v in value)
+    return value
+
+
+def _scrub_processor(
+    _logger: Any, _name: str, event_dict: MutableMapping[str, Any]
+) -> MutableMapping[str, Any]:
+    for key, value in event_dict.items():
+        event_dict[key] = scrub_value(value)
+    return event_dict
 
 
 def _split_csv(value: str) -> list[str]:
@@ -65,6 +130,14 @@ class Settings(BaseSettings):
     include_hidden_lists: bool = False
     include_document_libraries: bool = True
 
+    # ---- Item source ----
+    #: Which API fetches list items. Web discovery, schema and change tokens are
+    #: always SOAP — OData has no equivalent for them.
+    api_mode: ApiMode = "soap"
+    #: $expand lookup columns so labels come back alongside ids. Some 2010 farms
+    #: 500 on wide expands; the crawler retries without it automatically.
+    odata_expand_lookups: bool = True
+
     # ---- Paging ----
     page_size: int = Field(default=200, ge=1)
 
@@ -80,6 +153,16 @@ class Settings(BaseSettings):
     # ---- Logging ----
     log_level: str = "INFO"
     log_format: LogFormat = "console"
+    #: Capture request/response bodies. They are written to :attr:`trace_file`
+    #: at mode 0600, never to the log stream — stderr is the thing most likely
+    #: to end up in a shared file.
+    log_bodies: bool = False
+    #: Where captured bodies go. Defaults to ``{landing_dir}/_trace.log``.
+    trace_file: Path | None = None
+    #: How much of each body to log.
+    log_body_chars: int = 2000
+    #: Print the numbered step-by-step narration. Off in json log format.
+    show_steps: bool = True
 
     # ---- Tests ----
     live_tests: bool = False
@@ -115,6 +198,15 @@ class Settings(BaseSettings):
     @property
     def skip_extensions_list(self) -> list[str]:
         return [e.lower() if e.startswith(".") else "." + e.lower() for e in _split_csv(self.skip_extensions)]
+
+    @property
+    def resolved_trace_file(self) -> Path:
+        return self.trace_file or (self.landing_dir / "_trace.log")
+
+    @property
+    def needs_password(self) -> bool:
+        """Only these modes carry a secret in-process."""
+        return self.auth_mode in ("ntlm", "basic")
 
     @property
     def max_file_bytes(self) -> int:
@@ -170,6 +262,11 @@ def setup_logging(level: str = "INFO", fmt: LogFormat = "console") -> None:
             structlog.processors.TimeStamper(fmt="iso", utc=True),
             structlog.processors.StackInfoRenderer(),
             structlog.processors.format_exc_info,
+            # LAST before the renderer, deliberately: format_exc_info turns an
+            # exception into a rendered traceback string, and a traceback can
+            # carry a credential (a URL with embedded auth, a driver message).
+            # Scrubbing earlier would miss it entirely.
+            _scrub_processor,
             renderer,
         ],
         wrapper_class=structlog.make_filtering_bound_logger(levelno),

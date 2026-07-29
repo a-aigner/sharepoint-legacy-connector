@@ -9,10 +9,13 @@ impossible to get wrong.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, cast
 
 from lxml import etree
+
+from .config import get_logger
 
 SOAP_ENV_NS = "http://schemas.xmlsoap.org/soap/envelope/"
 SP_SOAP_NS = "http://schemas.microsoft.com/sharepoint/soap/"
@@ -22,6 +25,19 @@ XSD_NS = "http://www.w3.org/2001/XMLSchema"
 ENVELOPE_NSMAP = {"xsi": XSI_NS, "xsd": XSD_NS, "soap": SOAP_ENV_NS}
 
 ParamValue = str | int | None | etree._Element | Sequence["etree._Element"]
+
+log = get_logger(__name__)
+
+
+#: Substrings identifying an ``SPQueryThrottledException`` surfaced as a fault.
+#: German is included deliberately — this farm's UI language is German.
+LIST_VIEW_THRESHOLD_MARKERS = (
+    "list view threshold",
+    "exceeds the list view",
+    "listenansichtsschwellenwert",
+    "schwellenwert für die listenansicht",
+    "0x80070024",
+)
 
 
 class SharePointSoapFault(Exception):
@@ -45,6 +61,14 @@ class SharePointSoapFault(Exception):
         self.errorcode = errorcode
         self.errorstring = errorstring
         self.endpoint = endpoint
+
+    @property
+    def is_list_view_threshold(self) -> bool:
+        """SharePoint 2010+ throttling, in either language this farm might use."""
+        haystack = " ".join(
+            part for part in (self.faultstring, self.errorstring, self.errorcode) if part
+        ).lower()
+        return any(marker in haystack for marker in LIST_VIEW_THRESHOLD_MARKERS)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -167,19 +191,78 @@ def parse_fault(
     )
 
 
+SNIPPET_BYTES = 400
+
+
+def diagnose_body(body: bytes) -> str:
+    """Guess why a body is not the SOAP we asked for, in operator-readable terms."""
+    if not body.strip():
+        return "empty response body — a proxy or WAF may be stripping it"
+    head = body[:8192].lower()
+    if b"did not recognize the value of http header soapaction" in head:
+        return "the server does not implement this operation on this build"
+    if b"login.aspx" in head or (b"<form" in head and b'name="__viewstate"' in head):
+        return "looks like a forms-authentication login page, not SOAP — FBA is not supported"
+    if head.lstrip()[:6].startswith(b"<html") or b"<html" in head[:512]:
+        return "looks like an HTML page, not SOAP — an IIS error page, a proxy, or a login form"
+    if b"<soap:envelope" not in head and b"envelope" not in head:
+        return "not a SOAP envelope at all"
+    return "a SOAP envelope, but without the expected result element"
+
+
+class SoapResponseError(ValueError):
+    """The server answered, but not with the SOAP we asked for.
+
+    Carries the body. Discarding the bytes that would explain the failure is
+    exactly the wrong thing to do on a farm you cannot casually re-query.
+    """
+
+    def __init__(
+        self,
+        operation: str,
+        message: str,
+        *,
+        body: bytes = b"",
+        endpoint: str | None = None,
+    ) -> None:
+        self.operation = operation
+        self.body = body
+        self.endpoint = endpoint
+        self.diagnosis = diagnose_body(body)
+        snippet = body[:SNIPPET_BYTES].decode("utf-8", "replace").strip()
+        detail = f"{operation}: {message} ({self.diagnosis})"
+        if snippet:
+            detail += f"\n  first {min(len(body), SNIPPET_BYTES)} bytes: {snippet}"
+        super().__init__(detail)
+
+    def save_body(self, path: Any) -> Any:
+        """Write the full body to a ``0600`` file for inspection.
+
+        Captured error bodies routinely contain session cookies and whatever the
+        proxy felt like echoing, so this is not a world-readable artifact.
+        """
+        from pathlib import Path
+
+        from .trace import write_private_bytes
+
+        return write_private_bytes(Path(path), self.body)
+
+
 def parse_response(payload: bytes, operation: str, endpoint: str | None = None) -> etree._Element:
     """Parse a response body and return the ``{operation}Result`` element.
 
-    Raises :class:`SharePointSoapFault` on a fault body, and ``ValueError`` when
-    the response is not the expected shape.
+    Raises :class:`SharePointSoapFault` on a fault body and
+    :class:`SoapResponseError` (a ``ValueError``) on anything else unexpected.
     """
     parser = etree.XMLParser(recover=True, huge_tree=True, resolve_entities=False)
     try:
         root = etree.fromstring(payload, parser=parser)
     except etree.XMLSyntaxError as exc:  # pragma: no cover - recover=True rarely raises
-        raise ValueError(f"{operation}: response was not parseable XML: {exc}") from exc
+        raise SoapResponseError(
+            operation, "response was not parseable XML", body=payload, endpoint=endpoint
+        ) from exc
     if root is None:
-        raise ValueError(f"{operation}: empty response body")
+        raise SoapResponseError(operation, "empty response body", body=payload, endpoint=endpoint)
 
     fault = parse_fault(root, operation, endpoint)
     if fault is not None:
@@ -187,7 +270,12 @@ def parse_response(payload: bytes, operation: str, endpoint: str | None = None) 
 
     result = find_one(root, f"{operation}Result")
     if result is None:
-        raise ValueError(f"{operation}: no <{operation}Result> element in response")
+        raise SoapResponseError(
+            operation,
+            f"no <{operation}Result> element in response",
+            body=payload,
+            endpoint=endpoint,
+        )
     return result
 
 
@@ -205,5 +293,20 @@ class SoapClient:
 
     def call(self, operation: str, params: Mapping[str, ParamValue] | None = None) -> etree._Element:
         body = build_envelope(operation, params)
+        log.debug(
+            "soap.call",
+            operation=operation,
+            endpoint=self.endpoint,
+            params=sorted((params or {}).keys()),
+            envelope_bytes=len(body),
+        )
+        started = time.monotonic()
         payload = self.transport.post_soap(self.endpoint, body, soap_action(operation))
-        return parse_response(payload, operation, self.endpoint)
+        result = parse_response(payload, operation, self.endpoint)
+        log.debug(
+            "soap.ok",
+            operation=operation,
+            duration=round(time.monotonic() - started, 3),
+            response_bytes=len(payload),
+        )
+        return result

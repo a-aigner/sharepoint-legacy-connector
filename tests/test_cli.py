@@ -54,8 +54,39 @@ def test_probe_succeeds(env_file: Path, farm: FakeFarm) -> None:
     assert result.exit_code == 0
     assert "12.0.0.6421" in result.stdout
     assert "WSS 3.0 / MOSS 2007" in result.stdout
-    assert "2 readable by this credential" in result.stdout
-    assert result.stdout.rstrip().endswith("OK")
+    assert "2 readable via GetAllSubWebCollection" in result.stdout
+    assert result.stdout.rstrip().endswith("PROBE OK — the connector can read this farm.")
+
+
+def test_probe_narrates_every_step_in_order(env_file: Path, farm: FakeFarm) -> None:
+    result = run(env_file, "probe")
+    expected = [
+        "Reach the server",
+        "Determine authentication scheme",
+        "Authenticate",
+        "Read server build number",
+        "Enumerate webs",
+        "List inventory on the first web",
+        "SiteData liveness",
+        "ListData.svc",
+    ]
+    positions = [result.stdout.index(label) for label in expected]
+    assert positions == sorted(positions)
+    assert "[1/8]" in result.stdout and "[8/8]" in result.stdout
+    assert result.stdout.count(" OK    ") >= 8
+    assert "login successful" in result.stdout
+
+
+def test_probe_reports_request_count_and_bytes(env_file: Path, farm: FakeFarm) -> None:
+    result = run(env_file, "probe")
+    assert "HTTP requests," in result.stdout
+    assert "received" in result.stdout
+
+
+def test_quiet_suppresses_the_narration(env_file: Path, farm: FakeFarm) -> None:
+    result = run(env_file, "--quiet", "probe")
+    assert result.exit_code == 0
+    assert "[1/8]" not in result.stdout
 
 
 def test_probe_exits_nonzero_when_the_server_is_unreachable(tmp_path: Path) -> None:
@@ -213,3 +244,45 @@ def test_sync_records_the_delete(env_file: Path, farm: FakeFarm, tmp_path: Path)
     result = run(env_file, "sync")
     assert result.exit_code == 0
     assert "items deleted      : 1" in result.stdout
+
+
+# --------------------------------------------------------------------------- #
+# diagnostics: auth schemes, discovery method, bad response bodies
+# --------------------------------------------------------------------------- #
+
+
+def test_probe_reports_the_offered_auth_schemes(env_file: Path, farm: FakeFarm) -> None:
+    result = run(env_file, "probe")
+    assert "Determine authentication scheme" in result.stdout
+
+
+def test_probe_reports_which_discovery_call_was_used(env_file: Path, farm: FakeFarm) -> None:
+    result = run(env_file, "probe")
+    assert "via GetAllSubWebCollection" in result.stdout
+
+
+def test_probe_falls_back_and_says_so(env_file: Path, farm: FakeFarm) -> None:
+    farm.always_fail["GetAllSubWebCollection"] = "soap_fault_unknown_action.xml"
+    result = run(env_file, "probe")
+    assert result.exit_code == 0
+    assert "via GetWebCollection" in result.stdout
+    assert "falling back" in result.stdout
+    assert "2 readable" in result.stdout
+
+
+def test_probe_dumps_an_unusable_response_body_to_disk(
+    env_file: Path, farm: FakeFarm, tmp_path: Path
+) -> None:
+    # Both discovery calls return an FBA login page: nothing to fall back to.
+    farm.always_fail["GetAllSubWebCollection"] = "html_login_page.html"
+    farm.always_fail["GetWebCollection"] = "html_login_page.html"
+
+    result = run(env_file, "probe")
+
+    assert result.exit_code == 1
+    assert "FAILED" in result.stdout
+    assert "forms-authentication login page" in result.stdout
+    dumped = tmp_path / "landing" / "_last_bad_response.xml"
+    assert dumped.exists()
+    assert b"login.aspx" in dumped.read_bytes()
+    assert str(dumped) in result.stdout

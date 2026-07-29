@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <soap:Body>
+    <GetListResponse xmlns="http://schemas.microsoft.com/sharepoint/soap/">
+      <GetListResult>
+        <List DocTemplateUrl="/sites/service/Dokumente/Forms/template.doc"
+              DefaultViewUrl="/sites/service/Dokumente/Forms/AllItems.aspx"
+              ID="{33333333-3333-3333-3333-333333333333}"
+              Title="Dokumente"
+              Description="Handbücher und Prüfberichte"
+              BaseType="1"
+              ServerTemplate="101"
+              ItemCount="2"
+              RootFolder="/sites/service/Dokumente"
+              EnableAttachments="FALSE"
+              Hidden="FALSE"
+              HasUniqueScopes="FALSE">
+          <Fields>
+            <Field ID="{1d22ea11-1e32-424e-89ab-9fedbadb6ce1}" Name="ID" StaticName="ID"
+                   DisplayName="ID" Type="Counter" ReadOnly="TRUE" ColName="tp_ID"/>
+            <Field ID="{fa564e0f-0c70-4ab9-b863-0177e6ddd247}" Name="Title" StaticName="Title"
+                   DisplayName="Titel" Type="Text" MaxLength="255" ColName="nvarchar1"/>
+            <Field ID="{8553196d-ec8d-4564-9861-3dbe931050c8}" Name="FileLeafRef"
+                   StaticName="FileLeafRef" DisplayName="Name" Type="File"/>
+            <Field ID="{94f89715-e097-4e8b-ba79-ea02aa8b7adb}" Name="FileRef" StaticName="FileRef"
+                   DisplayName="URL-Pfad" Type="Lookup" ReadOnly="TRUE" Hidden="TRUE"/>
+            <Field ID="{4b7403de-8d94-43e8-9f0f-137a3e298126}" Name="EncodedAbsUrl"
+                   StaticName="EncodedAbsUrl" DisplayName="Absolute URL" Type="Computed"
+                   ReadOnly="TRUE" Hidden="TRUE"/>
+            <Field ID="{30bb605f-5bae-48fe-b4e3-1f81d9772af9}" Name="FSObjType"
+                   StaticName="FSObjType" DisplayName="Objekttyp" Type="Lookup" ReadOnly="TRUE"
+                   Hidden="TRUE" ColName="tp_Level"/>
+            <Field ID="{c1b2c3d4-0003-0000-0000-000000000001}" Name="Anlage" StaticName="Anlage"
+                   DisplayName="Zugehöriger Fall" Type="Lookup"
+                   List="{11111111-1111-1111-1111-111111111111}" ShowField="Title"
+                   ColName="int1"/>
+            <Field ID="{8c06beca-0777-48f7-91c7-6da68bc07b69}" Name="Created" StaticName="Created"
+                   DisplayName="Erstellt" Type="DateTime" ReadOnly="TRUE" ColName="tp_Created"/>
+            <Field ID="{28cf69c5-fa48-462a-b5cd-27b6f9d2bd5f}" Name="Modified" StaticName="Modified"
+                   DisplayName="Geändert" Type="DateTime" ReadOnly="TRUE" ColName="tp_Modified"/>
+          </Fields>
+        </List>
+      </GetListResult>
+    </GetListResponse>
+  </soap:Body>
+</soap:Envelope>

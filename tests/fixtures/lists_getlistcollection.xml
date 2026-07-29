@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <soap:Body>
+    <GetListCollectionResponse xmlns="http://schemas.microsoft.com/sharepoint/soap/">
+      <GetListCollectionResult>
+        <Lists>
+          <List DocTemplateUrl=""
+                DefaultViewUrl="/sites/service/Lists/Cases/AllItems.aspx"
+                ID="{11111111-1111-1111-1111-111111111111}"
+                Title="Servicefälle"
+                Description="Erfasste Servicevorgänge seit 2005"
+                BaseType="0"
+                ServerTemplate="100"
+                Created="20050112 09:14:22"
+                Modified="20110702 15:43:00"
+                ItemCount="3"
+                RootFolder="/sites/service/Lists/Cases"
+                EnableAttachments="TRUE"
+                EnableModeration="FALSE"
+                EnableVersioning="FALSE"
+                Hidden="FALSE"
+                HasUniqueScopes="TRUE"
+                Ordered="FALSE"
+                ShowUser="TRUE"/>
+          <List DocTemplateUrl=""
+                DefaultViewUrl="/sites/service/Lists/Kunden/AllItems.aspx"
+                ID="{22222222-2222-2222-2222-222222222222}"
+                Title="Kunden"
+                Description="Stammdaten"
+                BaseType="0"
+                ServerTemplate="100"
+                Created="20050112 09:15:02"
+                Modified="20091114 11:02:41"
+                ItemCount="0"
+                RootFolder="/sites/service/Lists/Kunden"
+                EnableAttachments="FALSE"
+                Hidden="FALSE"
+                HasUniqueScopes="FALSE"/>
+          <List DocTemplateUrl="/sites/service/Dokumente/Forms/template.doc"
+                DefaultViewUrl="/sites/service/Dokumente/Forms/AllItems.aspx"
+                ID="{33333333-3333-3333-3333-333333333333}"
+                Title="Dokumente"
+                Description="Handbücher und Prüfberichte"
+                BaseType="1"
+                ServerTemplate="101"
+                Created="20050112 09:16:44"
+                Modified="20120310 08:00:00"
+                ItemCount="2"
+                RootFolder="/sites/service/Dokumente"
+                EnableAttachments="FALSE"
+                Hidden="FALSE"
+                HasUniqueScopes="FALSE"/>
+          <List DefaultViewUrl="/sites/service/_catalogs/masterpage/Forms/AllItems.aspx"
+                ID="{44444444-4444-4444-4444-4444444444aa}"
+                Title="Master Page Gallery"
+                BaseType="1"
+                ServerTemplate="116"
+                ItemCount="17"
+                RootFolder="/sites/service/_catalogs/masterpage"
+                Hidden="FALSE"/>
+          <List DefaultViewUrl="/sites/service/Lists/Konfiguration/AllItems.aspx"
+                ID="{44444444-4444-4444-4444-4444444444bb}"
+                Title="Konfiguration"
+                BaseType="0"
+                ServerTemplate="100"
+                ItemCount="42"
+                RootFolder="/sites/service/Lists/Konfiguration"
+                Hidden="TRUE"/>
+        </Lists>
+      </GetListCollectionResult>
+    </GetListCollectionResponse>
+  </soap:Body>
+</soap:Envelope>

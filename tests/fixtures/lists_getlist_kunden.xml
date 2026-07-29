@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <soap:Body>
+    <GetListResponse xmlns="http://schemas.microsoft.com/sharepoint/soap/">
+      <GetListResult>
+        <List DefaultViewUrl="/sites/service/Lists/Kunden/AllItems.aspx"
+              ID="{22222222-2222-2222-2222-222222222222}"
+              Title="Kunden"
+              Description="Stammdaten"
+              BaseType="0"
+              ServerTemplate="100"
+              ItemCount="0"
+              RootFolder="/sites/service/Lists/Kunden"
+              EnableAttachments="FALSE"
+              Hidden="FALSE"
+              HasUniqueScopes="FALSE">
+          <Fields>
+            <Field ID="{1d22ea11-1e32-424e-89ab-9fedbadb6ce1}" Name="ID" StaticName="ID"
+                   DisplayName="ID" Type="Counter" ReadOnly="TRUE" ColName="tp_ID"/>
+            <Field ID="{fa564e0f-0c70-4ab9-b863-0177e6ddd247}" Name="Title" StaticName="Title"
+                   DisplayName="Firma" Type="Text" Required="TRUE" MaxLength="255"
+                   ColName="nvarchar1"/>
+            <Field ID="{b1b2c3d4-0002-0000-0000-000000000001}" Name="Ort" StaticName="Ort"
+                   DisplayName="Ort" Type="Text" MaxLength="128" ColName="nvarchar2"/>
+            <Field ID="{b1b2c3d4-0002-0000-0000-000000000002}" Name="Hauptansprechpartner"
+                   StaticName="Hauptansprechpartner" DisplayName="Hauptansprechpartner"
+                   Type="User" List="UserInfo" ShowField="ImnName" ColName="int1"/>
+            <Field ID="{8c06beca-0777-48f7-91c7-6da68bc07b69}" Name="Created" StaticName="Created"
+                   DisplayName="Erstellt" Type="DateTime" ReadOnly="TRUE" ColName="tp_Created"/>
+            <Field ID="{28cf69c5-fa48-462a-b5cd-27b6f9d2bd5f}" Name="Modified" StaticName="Modified"
+                   DisplayName="Geändert" Type="DateTime" ReadOnly="TRUE" ColName="tp_Modified"/>
+          </Fields>
+        </List>
+      </GetListResult>
+    </GetListResponse>
+  </soap:Body>
+</soap:Envelope>

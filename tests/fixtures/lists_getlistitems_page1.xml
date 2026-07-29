@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <soap:Body>
+    <GetListItemsResponse xmlns="http://schemas.microsoft.com/sharepoint/soap/">
+      <GetListItemsResult>
+        <listitems xmlns:s="uuid:BDC6E3F0-6DA3-11d1-A2A3-00AA00C14882"
+                   xmlns:dt="uuid:C2F41010-65B3-11d1-A29F-00AA00C14882"
+                   xmlns:rs="urn:schemas-microsoft-com:rowset"
+                   xmlns:z="#RowsetSchema">
+          <rs:data ItemCount="2" ListItemCollectionPositionNext="Paged=TRUE&amp;p_ID=2">
+            <z:row ows_ID="1"
+                   ows_Title="Getriebeschaden"
+                   ows_Case_x0020_Number="SF-2009-0001"
+                   ows_Kunde="42;#Müller Maschinenbau GmbH"
+                   ows_Betroffene_x0020_Anlagen="12;#Presse Süd;#13;#Fräse Nord;#14;#Ofen Weiß"
+                   ows_Vorgaenger="7;#Vorfall Straßenbahn"
+                   ows_Kategorie=";#Reparatur;#Garantie;#"
+                   ows_Beschreibung="&lt;div&gt;Kunde meldet &lt;b&gt;lautes&lt;/b&gt; Geräusch &amp;amp; starke Vibration.&lt;/div&gt;"
+                   ows_Kosten="1234.500000000000"
+                   ows_Erledigt="1"
+                   ows_Eingegangen="2009-03-14T08:11:00Z"
+                   ows_Faellig="2009-03-21T00:00:00Z"
+                   ows_Bearbeiter="12;#CONTOSO\jdoe"
+                   ows_Techniker="12;#CONTOSO\jdoe;#15;#CONTOSO\mmueller"
+                   ows_Kostensch_x00e4_tzung="float;#1469.055"
+                   ows_Wiedervorlage="datetime;#2009-03-21 00:00:00"
+                   ows_Referenz="http://intranet/sop/17, Reparaturanleitung Süd"
+                   ows_Prioritaet="Hoch"
+                   ows_Meldungen="3.0000000000"
+                   ows_ContentType="Element"
+                   ows_Created="2009-03-14T08:11:00Z"
+                   ows_Modified="2011-07-02T15:43:00Z"
+                   ows_Author="1;#CONTOSO\admin"
+                   ows_Editor="12;#CONTOSO\jdoe"
+                   ows_Attachments="1"
+                   ows_AttachmentUrls="http://sp/sites/service/Lists/Cases/Attachments/1/foto.jpg"
+                   ows_FSObjType="0"
+                   ows_UniqueId="1;#{aaaaaaaa-0000-0000-0000-000000000001}"
+                   ows_GUID="{bbbbbbbb-0000-0000-0000-000000000001}"
+                   ows_FileRef="1;#sites/service/Lists/Cases/1_.000"
+                   ows_FileLeafRef="1;#1_.000"
+                   ows_EncodedAbsUrl="http://sp/sites/service/Lists/Cases/1_.000"
+                   ows_MetaInfo="vti_parserversion:SR|12.0.0.6421"
+                   ows_owshiddenversion="9"/>
+            <z:row ows_ID="2"
+                   ows_Title="Ölwechsel überfällig"
+                   ows_Case_x0020_Number="SF-2010-0042"
+                   ows_Kunde="57;#Beta AG"
+                   ows_Kategorie=";#Wartung;#"
+                   ows_Beschreibung="Routineprüfung, keine Auffälligkeiten."
+                   ows_Kosten="0.000000000000"
+                   ows_Erledigt="0"
+                   ows_Eingegangen="2010-11-02T09:30:00Z"
+                   ows_Kostensch_x00e4_tzung="float;#0"
+                   ows_Referenz=""
+                   ows_Prioritaet="Niedrig"
+                   ows_Meldungen=""
+                   ows_ContentType="Element"
+                   ows_Created="2010-11-02T09:30:00Z"
+                   ows_Modified="2010-11-02T09:31:00Z"
+                   ows_Author="1;#CONTOSO\admin"
+                   ows_Editor="1;#CONTOSO\admin"
+                   ows_Attachments="0"
+                   ows_FSObjType="1;#0"
+                   ows_UniqueId="1;#{aaaaaaaa-0000-0000-0000-000000000002}"
+                   ows_GUID="{bbbbbbbb-0000-0000-0000-000000000002}"
+                   ows_FileRef="2;#sites/service/Lists/Cases/2_.000"
+                   ows_FileLeafRef="2;#2_.000"
+                   ows_EncodedAbsUrl="http://sp/sites/service/Lists/Cases/2_.000"
+                   ows_MetaInfo="vti_parserversion:SR|12.0.0.6421"
+                   ows_owshiddenversion="2"/>
+          </rs:data>
+        </listitems>
+      </GetListItemsResult>
+    </GetListItemsResponse>
+  </soap:Body>
+</soap:Envelope>

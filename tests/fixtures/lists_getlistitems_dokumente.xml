@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <soap:Body>
+    <GetListItemsResponse xmlns="http://schemas.microsoft.com/sharepoint/soap/">
+      <GetListItemsResult>
+        <listitems xmlns:s="uuid:BDC6E3F0-6DA3-11d1-A2A3-00AA00C14882"
+                   xmlns:dt="uuid:C2F41010-65B3-11d1-A29F-00AA00C14882"
+                   xmlns:rs="urn:schemas-microsoft-com:rowset"
+                   xmlns:z="#RowsetSchema">
+          <rs:data ItemCount="2">
+            <z:row ows_ID="1"
+                   ows_Title="Handbuch"
+                   ows_FileLeafRef="1;#Handbuch Straße.pdf"
+                   ows_FileRef="1;#sites/service/Dokumente/Handbuch Straße.pdf"
+                   ows_EncodedAbsUrl="http://sp/sites/service/Dokumente/Handbuch%20Stra%C3%9Fe.pdf"
+                   ows_FSObjType="0"
+                   ows_Anlage="1;#Getriebeschaden"
+                   ows_ContentType="Dokument"
+                   ows_Created="2007-05-02T10:00:00Z"
+                   ows_Modified="2012-03-10T08:00:00Z"
+                   ows_UniqueId="1;#{cccccccc-0000-0000-0000-000000000001}"
+                   ows_MetaInfo="vti_parserversion:SR|12.0.0.6421"/>
+            <z:row ows_ID="2"
+                   ows_Title=""
+                   ows_FileLeafRef="2;#Prüfberichte"
+                   ows_FileRef="2;#sites/service/Dokumente/Prüfberichte"
+                   ows_EncodedAbsUrl="http://sp/sites/service/Dokumente/Pr%C3%BCfberichte"
+                   ows_FSObjType="1;#1"
+                   ows_ContentType="Ordner"
+                   ows_Created="2007-05-02T10:01:00Z"
+                   ows_Modified="2007-05-02T10:01:00Z"
+                   ows_UniqueId="1;#{cccccccc-0000-0000-0000-000000000002}"/>
+          </rs:data>
+        </listitems>
+      </GetListItemsResult>
+    </GetListItemsResponse>
+  </soap:Body>
+</soap:Envelope>

@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <soap:Body>
+    <GetListItemsResponse xmlns="http://schemas.microsoft.com/sharepoint/soap/">
+      <GetListItemsResult>
+        <listitems xmlns:s="uuid:BDC6E3F0-6DA3-11d1-A2A3-00AA00C14882"
+                   xmlns:dt="uuid:C2F41010-65B3-11d1-A29F-00AA00C14882"
+                   xmlns:rs="urn:schemas-microsoft-com:rowset"
+                   xmlns:z="#RowsetSchema">
+          <rs:data ItemCount="1">
+            <z:row ows_ID="3"
+                   ows_Title="Getriebe Straßenbahn — Nachtrag"
+                   ows_Case_x0020_Number="SF-2011-0117"
+                   ows_Kunde="42;#Müller Maschinenbau GmbH"
+                   ows_Vorgaenger="1;#Getriebeschaden"
+                   ows_Kategorie=";#Kulanz &amp;amp; Sonstiges;#"
+                   ows_Beschreibung="Nachtrag zu &lt;a href=&quot;/sites/service/Lists/Cases/DispForm.aspx?ID=1&quot;&gt;SF-2009-0001&lt;/a&gt;"
+                   ows_Kosten="87.900000000000"
+                   ows_Erledigt="0"
+                   ows_Eingegangen="2011-06-30T22:00:00Z"
+                   ows_Wiedervorlage="datetime;#2011-07-07 22:00:00"
+                   ows_Kostensch_x00e4_tzung="float;#104.601"
+                   ows_Prioritaet="Mittel"
+                   ows_ContentType="Element"
+                   ows_Created="2011-06-30T22:00:00Z"
+                   ows_Modified="2011-07-01T06:12:00Z"
+                   ows_Author="12;#CONTOSO\jdoe"
+                   ows_Editor="12;#CONTOSO\jdoe"
+                   ows_Attachments="1"
+                   ows_FSObjType="0"
+                   ows_UniqueId="1;#{aaaaaaaa-0000-0000-0000-000000000003}"
+                   ows_GUID="{bbbbbbbb-0000-0000-0000-000000000003}"
+                   ows_FileRef="3;#sites/service/Lists/Cases/3_.000"
+                   ows_FileLeafRef="3;#3_.000"
+                   ows_EncodedAbsUrl="http://sp/sites/service/Lists/Cases/3_.000"
+                   ows_MetaInfo="vti_parserversion:SR|12.0.0.6421"
+                   ows_owshiddenversion="1"/>
+          </rs:data>
+        </listitems>
+      </GetListItemsResult>
+    </GetListItemsResponse>
+  </soap:Body>
+</soap:Envelope>

@@ -1,0 +1,142 @@
+<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <soap:Body>
+    <GetListResponse xmlns="http://schemas.microsoft.com/sharepoint/soap/">
+      <GetListResult>
+        <List DocTemplateUrl=""
+              DefaultViewUrl="/sites/service/Lists/Cases/AllItems.aspx"
+              ID="{11111111-1111-1111-1111-111111111111}"
+              Title="Servicefälle"
+              Description="Erfasste Servicevorgänge seit 2005"
+              BaseType="0"
+              ServerTemplate="100"
+              Created="20050112 09:14:22"
+              Modified="20110702 15:43:00"
+              ItemCount="3"
+              RootFolder="/sites/service/Lists/Cases"
+              EnableAttachments="TRUE"
+              Hidden="FALSE"
+              HasUniqueScopes="TRUE"
+              Version="812">
+          <Fields>
+            <Field ID="{1d22ea11-1e32-424e-89ab-9fedbadb6ce1}" Name="ID" StaticName="ID"
+                   DisplayName="ID" Type="Counter" ReadOnly="TRUE" Hidden="FALSE"
+                   ColName="tp_ID"/>
+            <Field ID="{fa564e0f-0c70-4ab9-b863-0177e6ddd247}" Name="Title" StaticName="Title"
+                   DisplayName="Titel" Type="Text" Required="TRUE" MaxLength="255"
+                   ColName="nvarchar1"/>
+            <Field ID="{a1b2c3d4-0001-0000-0000-000000000001}" Name="Case_x0020_Number"
+                   StaticName="Case_x0020_Number" DisplayName="Case Number" Type="Text"
+                   Required="FALSE" MaxLength="64" ColName="nvarchar2"/>
+            <Field ID="{a1b2c3d4-0001-0000-0000-000000000002}" Name="Kunde" StaticName="Kunde"
+                   DisplayName="Kunde" Type="Lookup"
+                   List="{22222222-2222-2222-2222-222222222222}" ShowField="Title"
+                   Required="TRUE" ColName="int1"/>
+            <Field ID="{a1b2c3d4-0001-0000-0000-000000000003}" Name="Betroffene_x0020_Anlagen"
+                   StaticName="Betroffene_x0020_Anlagen" DisplayName="Betroffene Anlagen"
+                   Type="LookupMulti" Mult="TRUE"
+                   List="{99999999-9999-9999-9999-999999999999}" ShowField="Title"
+                   ColName="int2"/>
+            <Field ID="{a1b2c3d4-0001-0000-0000-000000000004}" Name="Vorgaenger"
+                   StaticName="Vorgaenger" DisplayName="Vorgänger" Type="Lookup"
+                   List="Self" ShowField="Title" ColName="int3"/>
+            <Field ID="{a1b2c3d4-0001-0000-0000-000000000005}" Name="Kategorie"
+                   StaticName="Kategorie" DisplayName="Kategorie" Type="MultiChoice"
+                   Mult="TRUE" ColName="ntext1">
+              <CHOICES>
+                <CHOICE>Reparatur</CHOICE>
+                <CHOICE>Garantie</CHOICE>
+                <CHOICE>Wartung</CHOICE>
+                <CHOICE>Kulanz &amp; Sonstiges</CHOICE>
+              </CHOICES>
+            </Field>
+            <Field ID="{a1b2c3d4-0001-0000-0000-000000000006}" Name="Beschreibung"
+                   StaticName="Beschreibung" DisplayName="Beschreibung" Type="Note"
+                   NumLines="6" RichText="TRUE" ColName="ntext2"/>
+            <Field ID="{a1b2c3d4-0001-0000-0000-000000000007}" Name="Kosten" StaticName="Kosten"
+                   DisplayName="Kosten" Type="Currency" Decimals="2" LCID="1031"
+                   ColName="float1"/>
+            <Field ID="{a1b2c3d4-0001-0000-0000-000000000008}" Name="Erledigt"
+                   StaticName="Erledigt" DisplayName="Erledigt" Type="Boolean"
+                   ColName="bit1"/>
+            <Field ID="{a1b2c3d4-0001-0000-0000-000000000009}" Name="Eingegangen"
+                   StaticName="Eingegangen" DisplayName="Eingegangen am" Type="DateTime"
+                   Format="DateTime" ColName="datetime1"/>
+            <Field ID="{a1b2c3d4-0001-0000-0000-00000000000a}" Name="Faellig"
+                   StaticName="Faellig" DisplayName="Fällig" Type="DateTime"
+                   Format="DateOnly" ColName="datetime2"/>
+            <Field ID="{a1b2c3d4-0001-0000-0000-00000000000b}" Name="Bearbeiter"
+                   StaticName="Bearbeiter" DisplayName="Bearbeiter" Type="User"
+                   List="UserInfo" ShowField="ImnName" ColName="int4"/>
+            <Field ID="{a1b2c3d4-0001-0000-0000-00000000000c}" Name="Techniker"
+                   StaticName="Techniker" DisplayName="Techniker" Type="UserMulti"
+                   Mult="TRUE" List="UserInfo" ShowField="ImnName" ColName="int5"/>
+            <Field ID="{a1b2c3d4-0001-0000-0000-00000000000d}" Name="Kostensch_x00e4_tzung"
+                   StaticName="Kostensch_x00e4_tzung" DisplayName="Kostenschätzung"
+                   Type="Calculated" ResultType="Number" ReadOnly="TRUE" ColName="sql_variant1">
+              <Formula>=Kosten*1.19</Formula>
+            </Field>
+            <Field ID="{a1b2c3d4-0001-0000-0000-00000000000e}" Name="Wiedervorlage"
+                   StaticName="Wiedervorlage" DisplayName="Wiedervorlage" Type="Calculated"
+                   ResultType="DateTime" ReadOnly="TRUE" ColName="sql_variant2">
+              <Formula>=Eingegangen+7</Formula>
+            </Field>
+            <Field ID="{a1b2c3d4-0001-0000-0000-00000000000f}" Name="Referenz"
+                   StaticName="Referenz" DisplayName="Referenz" Type="URL" Format="Hyperlink"
+                   ColName="nvarchar3"/>
+            <Field ID="{a1b2c3d4-0001-0000-0000-000000000010}" Name="Prioritaet"
+                   StaticName="Prioritaet" DisplayName="Priorität" Type="Choice"
+                   ColName="nvarchar4">
+              <CHOICES>
+                <CHOICE>Hoch</CHOICE>
+                <CHOICE>Mittel</CHOICE>
+                <CHOICE>Niedrig</CHOICE>
+              </CHOICES>
+            </Field>
+            <Field ID="{a1b2c3d4-0001-0000-0000-000000000011}" Name="Meldungen"
+                   StaticName="Meldungen" DisplayName="Meldungen" Type="Number"
+                   ColName="float2"/>
+            <Field ID="{03e45e84-1992-4d42-9116-26f756012634}" Name="ContentTypeId"
+                   DisplayName="Inhaltstyp-ID" Type="ContentTypeId" ReadOnly="TRUE"
+                   Hidden="TRUE" ColName="tp_ContentTypeId"/>
+            <Field ID="{c042a256-787d-4a6f-8a8a-cf6ab767f12d}" Name="ContentType"
+                   DisplayName="Inhaltstyp" Type="Text" ReadOnly="TRUE" ColName="tp_ContentType"/>
+            <Field ID="{8c06beca-0777-48f7-91c7-6da68bc07b69}" Name="Created" StaticName="Created"
+                   DisplayName="Erstellt" Type="DateTime" ReadOnly="TRUE" ColName="tp_Created"/>
+            <Field ID="{28cf69c5-fa48-462a-b5cd-27b6f9d2bd5f}" Name="Modified" StaticName="Modified"
+                   DisplayName="Geändert" Type="DateTime" ReadOnly="TRUE" ColName="tp_Modified"/>
+            <Field ID="{1df5e554-ec7e-46a6-901d-d85a3881cb18}" Name="Author" StaticName="Author"
+                   DisplayName="Erstellt von" Type="User" ReadOnly="TRUE" List="UserInfo"
+                   ColName="tp_Author"/>
+            <Field ID="{d31655d1-1d5b-4511-95a1-7a09e9b75bf2}" Name="Editor" StaticName="Editor"
+                   DisplayName="Geändert von" Type="User" ReadOnly="TRUE" List="UserInfo"
+                   ColName="tp_Editor"/>
+            <Field ID="{26d0756c-986a-48a7-af35-bf18ab85ff4a}" Name="Attachments"
+                   StaticName="Attachments" DisplayName="Anlagen" Type="Attachments"
+                   ReadOnly="TRUE" ColName="tp_HasAttachment"/>
+            <Field ID="{30bb605f-5bae-48fe-b4e3-1f81d9772af9}" Name="FSObjType"
+                   StaticName="FSObjType" DisplayName="Objekttyp" Type="Lookup" ReadOnly="TRUE"
+                   Hidden="TRUE" ColName="tp_Level"/>
+            <Field ID="{94f89715-e097-4e8b-ba79-ea02aa8b7adb}" Name="FileRef" StaticName="FileRef"
+                   DisplayName="URL-Pfad" Type="Lookup" ReadOnly="TRUE" Hidden="TRUE"/>
+            <Field ID="{8553196d-ec8d-4564-9861-3dbe931050c8}" Name="FileLeafRef"
+                   StaticName="FileLeafRef" DisplayName="Name" Type="File" ReadOnly="FALSE"/>
+            <Field ID="{4b7403de-8d94-43e8-9f0f-137a3e298126}" Name="EncodedAbsUrl"
+                   StaticName="EncodedAbsUrl" DisplayName="Absolute URL" Type="Computed"
+                   ReadOnly="TRUE" Hidden="TRUE"/>
+            <Field ID="{4b1bf6c6-4f39-45ac-acd5-16fe7a214e5e}" Name="MetaInfo"
+                   StaticName="MetaInfo" DisplayName="Eigenschaftensammlung" Type="Note"
+                   ReadOnly="TRUE" Hidden="TRUE" ColName="tp_MetaInfo"/>
+          </Fields>
+          <RegionalSettings>
+            <Language>1031</Language>
+            <Locale>1031</Locale>
+            <Time24>True</Time24>
+          </RegionalSettings>
+        </List>
+      </GetListResult>
+    </GetListResponse>
+  </soap:Body>
+</soap:Envelope>

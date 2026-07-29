@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <soap:Body>
+    <GetListCollectionResponse xmlns="http://schemas.microsoft.com/sharepoint/soap/">
+      <GetListCollectionResult>
+        <Lists>
+          <List DefaultViewUrl="/sites/service/cases2008/Lists/Cases/AllItems.aspx"
+                ID="{55555555-5555-5555-5555-555555555555}"
+                Title="Servicefälle 2008"
+                Description="Archiv"
+                BaseType="0"
+                ServerTemplate="100"
+                Created="20080101 00:00:00"
+                Modified="20090101 00:00:00"
+                ItemCount="3"
+                RootFolder="/sites/service/cases2008/Lists/Cases"
+                EnableAttachments="TRUE"
+                Hidden="FALSE"
+                HasUniqueScopes="FALSE"/>
+          <List DefaultViewUrl="/sites/service/cases2008/Lists/Kunden/AllItems.aspx"
+                ID="{66666666-6666-6666-6666-666666666666}"
+                Title="Kunden 2008"
+                BaseType="0"
+                ServerTemplate="100"
+                ItemCount="0"
+                RootFolder="/sites/service/cases2008/Lists/Kunden"
+                EnableAttachments="FALSE"
+                Hidden="FALSE"/>
+          <List DefaultViewUrl="/sites/service/cases2008/Dokumente/Forms/AllItems.aspx"
+                ID="{77777777-7777-7777-7777-777777777777}"
+                Title="Dokumente 2008"
+                BaseType="1"
+                ServerTemplate="101"
+                ItemCount="2"
+                RootFolder="/sites/service/cases2008/Dokumente"
+                EnableAttachments="FALSE"
+                Hidden="FALSE"/>
+        </Lists>
+      </GetListCollectionResult>
+    </GetListCollectionResponse>
+  </soap:Body>
+</soap:Envelope>

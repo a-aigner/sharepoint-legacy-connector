@@ -1,0 +1,498 @@
+"""``spconnect`` command line.
+
+Flag precedence is CLI > env var > ``.env`` > default; the CLI layer implements
+the first hop by passing overrides into :func:`spconnect.config.load_settings`.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+from typing import Annotated, Any
+
+import typer
+
+from . import __version__
+from .config import Settings, get_logger, load_settings, setup_logging
+from .crawl import CrawlAborted, Crawler, RunReport
+from .landing import LandingZone
+from .models import ListSchema
+from .schema import graph_summary, render_dot, render_mermaid
+from .services.sitedata import SiteDataService
+from .services.webs import WebsService
+from .state import StateStore
+from .transport import AuthenticationError, Transport
+
+log = get_logger(__name__)
+
+app = typer.Typer(
+    add_completion=False,
+    no_args_is_help=True,
+    help="Read-only extraction connector for legacy on-premises SharePoint (WSS 2.0/3.0, MOSS 2007).",
+)
+
+SCOPE_HELP = "Comma-separated; overrides the matching SP_* setting."
+
+
+class Context:
+    """Resolved settings plus the shared transport, built lazily per command."""
+
+    def __init__(self, settings: Settings, dry_run: bool) -> None:
+        self.settings = settings
+        self.dry_run = dry_run
+        self._transport: Transport | None = None
+
+    @property
+    def transport(self) -> Transport:
+        if self._transport is None:
+            self._transport = Transport(self.settings)
+        return self._transport
+
+    def crawler(self) -> Crawler:
+        return Crawler(self.settings, self.transport)
+
+    def close(self) -> None:
+        if self._transport is not None:
+            self._transport.close()
+            self._transport = None
+
+
+def _ctx(ctx: typer.Context) -> Context:
+    obj = ctx.obj
+    if not isinstance(obj, Context):  # pragma: no cover - typer always populates this
+        raise typer.BadParameter("CLI context was not initialised")
+    return obj
+
+
+def echo(message: str = "") -> None:
+    typer.echo(message)
+
+
+def _dump_json(payload: Any) -> str:
+    return json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+
+
+@app.callback(invoke_without_command=True)
+def main(
+    ctx: typer.Context,
+    env_file: Annotated[
+        Path | None, typer.Option("--env-file", help="Path to the .env file to load.")
+    ] = None,
+    log_level: Annotated[
+        str | None, typer.Option("--log-level", help="DEBUG | INFO | WARNING | ERROR.")
+    ] = None,
+    log_format: Annotated[str | None, typer.Option("--log-format", help="console | json.")] = None,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Discovery only: print what would be crawled.")
+    ] = False,
+    base_url: Annotated[str | None, typer.Option("--base-url", help="Override SP_BASE_URL.")] = None,
+    landing_dir: Annotated[
+        Path | None, typer.Option("--landing-dir", help="Override SP_LANDING_DIR.")
+    ] = None,
+    include_webs: Annotated[str | None, typer.Option("--include-webs", help=SCOPE_HELP)] = None,
+    exclude_webs: Annotated[str | None, typer.Option("--exclude-webs", help=SCOPE_HELP)] = None,
+    include_lists: Annotated[str | None, typer.Option("--include-lists", help=SCOPE_HELP)] = None,
+    exclude_lists: Annotated[str | None, typer.Option("--exclude-lists", help=SCOPE_HELP)] = None,
+    include_hidden_lists: Annotated[
+        bool | None, typer.Option("--include-hidden-lists/--no-include-hidden-lists")
+    ] = None,
+    include_document_libraries: Annotated[
+        bool | None, typer.Option("--include-document-libraries/--no-include-document-libraries")
+    ] = None,
+    download_files: Annotated[bool | None, typer.Option("--download-files/--no-download-files")] = None,
+    page_size: Annotated[int | None, typer.Option("--page-size", help="Override SP_PAGE_SIZE.")] = None,
+    version: Annotated[bool, typer.Option("--version", help="Print the version and exit.")] = False,
+) -> None:
+    if version:
+        echo(f"spconnect {__version__}")
+        raise typer.Exit(0)
+
+    overrides: dict[str, Any] = {
+        "log_level": log_level,
+        "log_format": log_format,
+        "base_url": base_url,
+        "landing_dir": landing_dir,
+        "include_webs": include_webs,
+        "exclude_webs": exclude_webs,
+        "include_lists": include_lists,
+        "exclude_lists": exclude_lists,
+        "include_hidden_lists": include_hidden_lists,
+        "include_document_libraries": include_document_libraries,
+        "download_files": download_files,
+        "page_size": page_size,
+    }
+    settings = load_settings(env_file=env_file, overrides=overrides)
+    if landing_dir is not None:
+        # An overridden landing zone takes its state file with it.
+        settings.state_file = Path(landing_dir) / "_state.json"
+    setup_logging(settings.log_level, settings.log_format)
+    ctx.obj = Context(settings, dry_run)
+
+
+# --------------------------------------------------------------------------- #
+# probe
+# --------------------------------------------------------------------------- #
+
+
+@app.command()
+def probe(ctx: typer.Context) -> None:
+    """Auth check, server version, and one trivial call. Nonzero exit on failure."""
+    context = _ctx(ctx)
+    settings = context.settings
+    echo(f"Base URL   : {settings.base_url}")
+    echo(f"Auth mode  : {settings.auth_mode} (user: {settings.username or '<none>'})")
+
+    try:
+        version = context.transport.probe_version()
+        echo(f"Server     : {version.raw or 'no version header'} -> {version.product}")
+
+        webs = WebsService(context.transport, settings.base_url).get_all_sub_web_collection()
+        echo(f"Webs       : {len(webs)} readable by this credential")
+        for web in webs[:10]:
+            echo(f"             - {web.url}  {web.title}")
+        if len(webs) > 10:
+            echo(f"             … and {len(webs) - 10} more")
+
+        ok, detail = SiteDataService(context.transport, settings.base_url).reachable()
+        echo(f"SiteData   : {'reachable' if ok else 'unreachable'}{f' ({detail})' if detail else ''}")
+
+        if not version.supports_change_tokens:
+            echo("")
+            echo("WARNING: this build predates change tokens; `spconnect sync` will do full crawls.")
+        echo("")
+        echo("OK")
+    except AuthenticationError as exc:
+        echo(f"\nAUTH FAILED: {exc}")
+        raise typer.Exit(2) from exc
+    except Exception as exc:
+        echo(f"\nFAILED: {type(exc).__name__}: {exc}")
+        raise typer.Exit(1) from exc
+    finally:
+        context.close()
+
+
+# --------------------------------------------------------------------------- #
+# discover
+# --------------------------------------------------------------------------- #
+
+
+@app.command()
+def discover(ctx: typer.Context) -> None:
+    """Enumerate webs and lists into ``webs.json``. No items. Run this first."""
+    context = _ctx(ctx)
+    crawler = context.crawler()
+    try:
+        if context.dry_run:
+            _print_dry_run(crawler.dry_run())
+        else:
+            webs, lists_by_web = crawler.discover()
+            echo(f"{len(webs)} webs, {sum(len(v) for v in lists_by_web.values())} in-scope lists")
+            for web_url, lists in lists_by_web.items():
+                echo(f"\n{web_url}")
+                for list_info in lists:
+                    flags = []
+                    if list_info.is_document_library:
+                        flags.append("doclib")
+                    if list_info.hidden:
+                        flags.append("hidden")
+                    if list_info.has_unique_scopes:
+                        flags.append("unique-scopes")
+                    suffix = f"  [{', '.join(flags)}]" if flags else ""
+                    echo(f"  {list_info.item_count:>8,}  {list_info.title}{suffix}")
+            echo(f"\nwebs.json -> {crawler.landing.webs_path}")
+            crawler.write_manifest("discover")
+        _print_unique_scope_warning(crawler.report)
+    finally:
+        context.close()
+
+
+# --------------------------------------------------------------------------- #
+# schema / graph
+# --------------------------------------------------------------------------- #
+
+
+@app.command()
+def schema(ctx: typer.Context) -> None:
+    """``GetList`` for every in-scope list; writes ``list.json`` files."""
+    context = _ctx(ctx)
+    crawler = context.crawler()
+    try:
+        _webs, lists_by_web = crawler.discover()
+        schemas = crawler.fetch_schemas(lists_by_web)
+        graph = crawler.build_graph(schemas)
+        crawler.write_manifest("schema")
+
+        echo(f"{len(schemas)} list schemas written under {crawler.landing.root}")
+        for summary_key, value in graph_summary(graph).items():
+            echo(f"  {summary_key:<20} {value}")
+        echo(f"\nGraph: {crawler.landing.graph_mmd_path}")
+        _print_unique_scope_warning(crawler.report)
+    finally:
+        context.close()
+
+
+@app.command()
+def graph(
+    ctx: typer.Context,
+    fmt: Annotated[str, typer.Option("--format", help="mermaid | json | dot")] = "mermaid",
+    out: Annotated[Path | None, typer.Option("--out", help="Write to this file instead of stdout.")] = None,
+) -> None:
+    """Build and emit the lookup graph from the cached schemas."""
+    context = _ctx(ctx)
+    landing = LandingZone(context.settings.landing_dir)
+    schemas: list[ListSchema] = list(landing.iter_list_schemas())
+    if not schemas:
+        echo(f"No cached schemas under {landing.root}. Run `spconnect schema` first.")
+        raise typer.Exit(1)
+
+    from .schema import build_lookup_graph
+
+    lookup_graph = build_lookup_graph(schemas)
+    landing.write_graph(lookup_graph)
+
+    fmt = fmt.lower()
+    if fmt == "json":
+        rendered = _dump_json(lookup_graph.model_dump(mode="json"))
+    elif fmt == "dot":
+        rendered = render_dot(lookup_graph)
+        landing.write_graph_dot(lookup_graph)
+    elif fmt == "mermaid":
+        rendered = render_mermaid(lookup_graph)
+    else:
+        raise typer.BadParameter("--format must be mermaid, json or dot")
+
+    if out is not None:
+        out.write_text(rendered, encoding="utf-8")
+        echo(f"wrote {out}")
+    else:
+        echo(rendered)
+
+    summary = graph_summary(lookup_graph)
+    if summary["dangling_edges"]:
+        echo(
+            f"\n{summary['dangling_edges']} dangling lookup edge(s): the target list is out of "
+            "scope or not readable by this credential.",
+        )
+
+
+# --------------------------------------------------------------------------- #
+# crawl / sync
+# --------------------------------------------------------------------------- #
+
+
+@app.command()
+def crawl(
+    ctx: typer.Context,
+    resume: Annotated[bool, typer.Option("--resume", help="Continue from the last checkpoint.")] = False,
+) -> None:
+    """Full extraction into the landing zone."""
+    context = _ctx(ctx)
+    crawler = context.crawler()
+    try:
+        if context.dry_run:
+            _print_dry_run(crawler.dry_run())
+            return
+        report = crawler.crawl(resume=resume)
+        crawler.write_manifest("crawl")
+        _print_summary(report, crawler)
+    except CrawlAborted as exc:
+        echo(f"\nABORTED: {exc}")
+        crawler.write_manifest("crawl")
+        raise typer.Exit(2) from exc
+    finally:
+        context.close()
+
+
+@app.command()
+def sync(ctx: typer.Context) -> None:
+    """Incremental update via change tokens, including deletes."""
+    context = _ctx(ctx)
+    crawler = context.crawler()
+    try:
+        if context.dry_run:
+            _print_dry_run(crawler.dry_run())
+            return
+        report = crawler.sync()
+        crawler.write_manifest("sync")
+        _print_summary(report, crawler)
+    except CrawlAborted as exc:
+        echo(f"\nABORTED: {exc}")
+        crawler.write_manifest("sync")
+        raise typer.Exit(2) from exc
+    finally:
+        context.close()
+
+
+# --------------------------------------------------------------------------- #
+# verify-time / stats
+# --------------------------------------------------------------------------- #
+
+
+@app.command("verify-time")
+def verify_time(
+    ctx: typer.Context,
+    list_name: Annotated[str, typer.Option("--list", help="List title or GUID.")],
+    item: Annotated[int, typer.Option("--item", help="Item ID.")],
+) -> None:
+    """Print raw vs decoded datetimes for one item, so a human can check UTC."""
+    context = _ctx(ctx)
+    crawler = context.crawler()
+    try:
+        result = crawler.verify_time(list_name, item)
+    except Exception as exc:
+        echo(f"FAILED: {type(exc).__name__}: {exc}")
+        raise typer.Exit(1) from exc
+    finally:
+        context.close()
+
+    echo(f"List        : {result['list_title']}  ({result['list_guid']})")
+    echo(f"Web         : {result['web_url']}")
+    echo(f"Item        : {result['item_id']}")
+    echo(f"Display form: {result['display_url']}")
+    echo(f"Query option: {result['query_options']}")
+    echo("")
+    echo(f"{'FIELD':<28} {'RAW WIRE VALUE':<26} DECODED (UTC)")
+    for row in result["fields"]:
+        echo(f"{row['field'][:27]:<28} {str(row['raw_wire_value'])[:25]:<26} {row['decoded_utc']}")
+    echo("")
+    echo("Open the display form above and compare against what SharePoint shows.")
+    echo("If they disagree, DateInUtc is not behaving as documented on this build.")
+
+
+@app.command()
+def stats(ctx: typer.Context) -> None:
+    """Summarise the landing zone: lists, items, files, bytes, errors."""
+    context = _ctx(ctx)
+    landing = LandingZone(context.settings.landing_dir)
+    if not landing.root.exists():
+        echo(f"No landing zone at {landing.root}")
+        raise typer.Exit(1)
+
+    data = landing.stats()
+    echo(f"Landing zone : {data['root']}")
+    echo(f"Webs         : {data['webs']}")
+    echo(f"Lists        : {data['lists']}")
+    echo(f"Items        : {data['items']:,}")
+    echo(f"Files        : {data['files']:,} ({data['file_bytes'] / 1024 / 1024:.1f} MB)")
+
+    state_path = context.settings.state_file
+    if state_path.exists():
+        store = StateStore(state_path)
+        by_status: dict[str, int] = {}
+        for entry in store.state.lists.values():
+            by_status[entry.status] = by_status.get(entry.status, 0) + 1
+        echo(f"State        : {', '.join(f'{k}={v}' for k, v in sorted(by_status.items())) or 'empty'}")
+        failed = [(g, e) for g, e in store.state.lists.items() if e.status == "failed"]
+        for guid, entry in failed[:20]:
+            echo(f"  FAILED {entry.list_title or guid}: {entry.error}")
+
+    manifest = landing.read_manifest()
+    if manifest is not None:
+        echo(f"Last command : {manifest.command} at {manifest.finished_at}")
+        echo(f"Server       : {manifest.server_version.get('product', 'unknown')}")
+        if manifest.errors:
+            echo(f"Errors       : {len(manifest.errors)}")
+            for error in manifest.errors[:20]:
+                echo(f"  [{error.scope}] {error.list_title or error.web_url}: {error.message[:160]}")
+        if manifest.lists_with_unique_scopes:
+            echo("")
+            _print_unique_scope_list(manifest.lists_with_unique_scopes)
+
+    if data["per_list"]:
+        echo("")
+        echo(f"{'ITEMS':>10}  {'FILES':>7}  LIST")
+        for row in sorted(data["per_list"], key=lambda r: -int(r["items"]))[:40]:
+            echo(f"{row['items']:>10,}  {row['files']:>7,}  {row['list_title'] or row['path']}")
+
+
+# --------------------------------------------------------------------------- #
+# output helpers
+# --------------------------------------------------------------------------- #
+
+
+def _print_dry_run(plan: dict[str, Any]) -> None:
+    echo("DRY RUN — nothing was fetched beyond discovery.\n")
+    echo(f"{'ITEMS':>10}  {'PAGES':>6}  {'REQ':>8}  LIST")
+    for row in sorted(plan["rows"], key=lambda r: -int(r["items"])):
+        flag = "  [unique-scopes]" if row["has_unique_scopes"] else ""
+        echo(
+            f"{row['items']:>10,}  {row['pages']:>6,}  {row['estimated_requests']:>8,}  "
+            f"{row['list_title']}{flag}"
+        )
+    echo("")
+    echo(f"Webs               : {plan['webs']}")
+    echo(f"Lists              : {plan['lists']}")
+    echo(f"Items              : {plan['items']:,}")
+    echo(f"Estimated requests : {plan['estimated_requests']:,}")
+    echo(f"Estimated wall time: ~{plan['estimated_minutes']:,} min at the configured rate limit")
+
+
+def _print_unique_scope_list(entries: list[str]) -> None:
+    echo("WARNING: item-level permissions detected on these lists:")
+    for entry in entries[:20]:
+        echo(f"  - {entry}")
+    if len(entries) > 20:
+        echo(f"  … and {len(entries) - 20} more")
+    echo(
+        "This connector crawls as a single identity, so per-item security is "
+        "flattened. The downstream vector DB will not preserve it."
+    )
+
+
+def _print_unique_scope_warning(report: RunReport) -> None:
+    if report.unique_scope_lists:
+        echo("")
+        _print_unique_scope_list(report.unique_scope_lists)
+
+
+def _print_summary(report: RunReport, crawler: Crawler) -> None:
+    echo("")
+    echo("─" * 72)
+    echo("SUMMARY")
+    echo(f"  webs discovered    : {report.webs_discovered}")
+    echo(f"  lists in scope     : {report.lists_in_scope}")
+    echo(f"  lists succeeded    : {report.lists_succeeded}")
+    echo(f"  lists failed       : {report.lists_failed}")
+    echo(f"  lists skipped      : {report.lists_skipped} (already complete)")
+    echo(f"  items written      : {report.items_written:,}")
+    echo(f"  items deleted      : {report.items_deleted:,}")
+    echo(f"  files downloaded   : {report.files_downloaded:,} ({report.file_bytes / 1024 / 1024:.1f} MB)")
+    echo(f"  files skipped      : {report.files_skipped:,}")
+    for reason, count in sorted(report.skip_reasons.items()):
+        echo(f"      {reason:<16} {count}")
+    echo(f"  decoder warnings   : {report.decoder_warnings:,}")
+    echo(f"  dangling lookups   : {report.dangling_edges}")
+    echo(f"  landing zone       : {crawler.landing.root}")
+    echo(f"  manifest           : {crawler.landing.manifest_path}")
+
+    if report.errors:
+        echo("")
+        echo(f"ERRORS ({len(report.errors)}) — recorded in _manifest.json:")
+        for error in report.errors[:20]:
+            echo(f"  [{error.scope}] {error.list_title or error.web_url}: {error.message[:160]}")
+        if len(report.errors) > 20:
+            echo(f"  … and {len(report.errors) - 20} more")
+
+    if report.warnings:
+        echo("")
+        echo("WARNINGS:")
+        for warning in report.warnings[:20]:
+            echo(f"  - {warning}")
+
+    _print_unique_scope_warning(report)
+
+
+def run() -> None:  # pragma: no cover - console-script shim
+    try:
+        app()
+    except KeyboardInterrupt:
+        echo(
+            "\nInterrupted. State was checkpointed after the last completed page; "
+            "re-run with `spconnect crawl --resume`."
+        )
+        sys.exit(130)
+
+
+if __name__ == "__main__":  # pragma: no cover
+    run()

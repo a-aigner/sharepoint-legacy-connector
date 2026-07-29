@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <soap:Body>
+    <GetListItemChangesSinceTokenResponse xmlns="http://schemas.microsoft.com/sharepoint/soap/">
+      <GetListItemChangesSinceTokenResult>
+        <listitems xmlns:rs="urn:schemas-microsoft-com:rowset" xmlns:z="#RowsetSchema">
+          <Changes>
+            <Id ChangeType="InvalidToken">The specified change token is invalid or has expired.</Id>
+          </Changes>
+          <rs:data ItemCount="0"/>
+        </listitems>
+      </GetListItemChangesSinceTokenResult>
+    </GetListItemChangesSinceTokenResponse>
+  </soap:Body>
+</soap:Envelope>

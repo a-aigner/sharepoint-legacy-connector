@@ -10,7 +10,9 @@ from spconnect.services.lists import id_page_query, query_options, view_fields
 from spconnect.soap import (
     SP_SOAP_NS,
     SharePointSoapFault,
+    SoapResponseError,
     build_envelope,
+    diagnose_body,
     element,
     find_all,
     find_one,
@@ -193,3 +195,94 @@ def test_fault_without_a_detail_block_still_parses() -> None:
         parse_response(payload, "GetList")
     assert excinfo.value.errorcode is None
     assert excinfo.value.errorstring is None
+
+
+# --------------------------------------------------------------------------- #
+# unexpected bodies keep their evidence
+# --------------------------------------------------------------------------- #
+
+
+def test_unexpected_body_carries_the_bytes_that_explain_it() -> None:
+    body = fixture_bytes("html_login_page.html")
+    with pytest.raises(SoapResponseError) as excinfo:
+        parse_response(body, "GetAllSubWebCollection", "http://sp/_vti_bin/Webs.asmx")
+
+    exc = excinfo.value
+    assert exc.operation == "GetAllSubWebCollection"
+    assert exc.body == body
+    assert exc.endpoint == "http://sp/_vti_bin/Webs.asmx"
+    # The message must be actionable on its own, in a domain with no debugger.
+    assert "no <GetAllSubWebCollectionResult>" in str(exc)
+    assert "forms-authentication login page" in str(exc)
+    assert "Anmelden" in str(exc)  # a snippet of the actual body
+
+
+def test_unexpected_body_is_still_a_value_error() -> None:
+    # Callers written against the old behaviour keep working.
+    with pytest.raises(ValueError):
+        parse_response(b"<html>nope</html>", "GetListItems")
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        (b"", "empty response body"),
+        (b"   \n", "empty response body"),
+        (b"<html><body>500 - Internal server error.</body></html>", "looks like an HTML page"),
+        (
+            b"<soap:Fault><faultstring>Server did not recognize the value of HTTP Header "
+            b"SOAPAction: x.</faultstring></soap:Fault>",
+            "does not implement this operation",
+        ),
+        (b"just some text", "not a SOAP envelope at all"),
+        (b'<soap:Envelope xmlns:soap="x"><soap:Body/></soap:Envelope>', "without the expected result"),
+    ],
+)
+def test_diagnose_body(body: bytes, expected: str) -> None:
+    assert expected in diagnose_body(body)
+
+
+def test_empty_response_is_diagnosed_not_just_reported() -> None:
+    with pytest.raises(SoapResponseError, match="empty response body"):
+        parse_response(b"", "GetListItems")
+
+
+def test_body_snippet_is_truncated(tmp_path) -> None:
+    body = b"<x>" + b"y" * 5000 + b"</x>"
+    with pytest.raises(SoapResponseError) as excinfo:
+        parse_response(body, "GetListItems")
+    assert len(str(excinfo.value)) < 1000
+
+
+def test_save_body_writes_the_whole_thing(tmp_path) -> None:
+    body = fixture_bytes("html_login_page.html")
+    with pytest.raises(SoapResponseError) as excinfo:
+        parse_response(body, "GetAllSubWebCollection")
+
+    target = excinfo.value.save_body(tmp_path / "landing" / "_last_bad_response.xml")
+
+    assert target.read_bytes() == body  # full body, not the snippet
+
+
+def test_list_view_threshold_fault_is_recognised_in_german() -> None:
+    with pytest.raises(SharePointSoapFault) as excinfo:
+        parse_response(fixture_bytes("soap_fault_threshold.xml"), "GetListItems")
+    assert excinfo.value.is_list_view_threshold is True
+
+
+def test_an_ordinary_fault_is_not_mistaken_for_throttling() -> None:
+    with pytest.raises(SharePointSoapFault) as excinfo:
+        parse_response(fixture_bytes("soap_fault.xml"), "GetListItems")
+    assert excinfo.value.is_list_view_threshold is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "The attempted operation is prohibited because it exceeds the list view threshold",
+        "Der Schwellenwert für die Listenansicht wurde überschritten",
+    ],
+)
+def test_threshold_markers_cover_both_languages(text: str) -> None:
+    fault = SharePointSoapFault("GetListItems", text)
+    assert fault.is_list_view_threshold is True

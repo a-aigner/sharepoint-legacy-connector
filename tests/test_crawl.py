@@ -10,6 +10,7 @@ import pytest
 from conftest import CASES, CASES2, DOKUMENTE, KUNDEN, WEB1, WEB2, FakeFarm, make_settings
 from spconnect.crawl import CrawlAborted, Crawler, display_url_for
 from spconnect.models import ListInfo, web_id_for
+from spconnect.services.lists import ListsService
 from spconnect.transport import AuthenticationError, ServerVersion, Transport
 
 
@@ -491,3 +492,140 @@ def test_verify_time_rejects_an_unknown_list(tmp_path: Path, farm: FakeFarm, tra
 )
 def test_display_url_for(info: ListInfo, expected: str) -> None:
     assert display_url_for(info, WEB1, 7) == expected
+
+
+# --------------------------------------------------------------------------- #
+# web discovery on a pre-WSS3 build
+# --------------------------------------------------------------------------- #
+
+
+def test_crawl_works_on_a_wss2_server_via_the_get_web_collection_walk(
+    tmp_path: Path, farm: FakeFarm, transport: Transport
+) -> None:
+    crawler = _crawler(tmp_path, transport, download_files=False)
+    crawler.server_version = ServerVersion(raw="6.0.2.6568", major=6)
+
+    report = crawler.crawl()
+
+    assert report.web_discovery_method == "GetWebCollection"
+    assert report.webs_discovered == 2
+    assert report.lists_succeeded == 6
+    assert farm.count("GetAllSubWebCollection") == 0
+    assert any("predates GetAllSubWebCollection" in w for w in report.warnings)
+    # And the landing zone is identical to the WSS 3.0 path.
+    assert [i["item_id"] for i in _lines(crawler.landing.list_dir(WEB1, CASES) / "items.jsonl")] == [1, 2, 3]
+
+
+def test_discovery_falls_back_when_the_operation_is_missing(
+    tmp_path: Path, farm: FakeFarm, transport: Transport
+) -> None:
+    # Version header says WSS 3.0, but the operation is not actually there.
+    farm.always_fail["GetAllSubWebCollection"] = "soap_fault_unknown_action.xml"
+    crawler = _crawler(tmp_path, transport, download_files=False)
+
+    webs, lists_by_web = crawler.discover()
+
+    assert [w.url for w in webs] == [WEB1, WEB2]
+    assert crawler.report.web_discovery_method == "GetWebCollection"
+    assert sum(len(v) for v in lists_by_web.values()) == 6
+    assert any("falling back" in w for w in crawler.report.warnings)
+
+
+def test_manifest_records_how_webs_were_discovered(crawled: Crawler) -> None:
+    manifest = json.loads(crawled.landing.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["web_discovery_method"] == "GetAllSubWebCollection"
+    assert manifest["server_version"]["supports_all_sub_web_collection"] is True
+
+
+# --------------------------------------------------------------------------- #
+# SharePoint 2010 specifics
+# --------------------------------------------------------------------------- #
+
+
+def _as_2010(crawler: Crawler) -> Crawler:
+    crawler.server_version = ServerVersion(raw="14.0.4762.1000", major=14)
+    return crawler
+
+
+def test_oversized_lists_are_flagged_at_discovery_not_after_an_hour_of_crawling(
+    tmp_path: Path, farm: FakeFarm, transport: Transport
+) -> None:
+    crawler = _as_2010(_crawler(tmp_path, transport, download_files=False))
+    original = ListsService.get_list_collection
+
+    def inflated(self):
+        lists = original(self)
+        for info in lists:
+            if info.guid == CASES:
+                info.item_count = 45_231
+        return lists
+
+    ListsService.get_list_collection = inflated
+    try:
+        crawler.discover()
+    finally:
+        ListsService.get_list_collection = original
+
+    assert any("45,231 items" in entry for entry in crawler.report.large_lists)
+    assert any("list view threshold" in w for w in crawler.report.warnings)
+    assert farm.count("GetListItems") == 0  # flagged before a single item was fetched
+
+
+def test_no_threshold_warning_on_a_wss3_farm(tmp_path: Path, farm: FakeFarm, transport: Transport) -> None:
+    crawler = _crawler(tmp_path, transport, download_files=False)
+    crawler.server_version = ServerVersion(raw="12.0.0.6421", major=12)
+    original = ListsService.get_list_collection
+
+    def inflated(self):
+        lists = original(self)
+        for info in lists:
+            info.item_count = 45_231
+        return lists
+
+    ListsService.get_list_collection = inflated
+    try:
+        crawler.discover()
+    finally:
+        ListsService.get_list_collection = original
+
+    assert crawler.report.large_lists == []  # WSS 3.0 has no such limit
+
+
+def test_a_throttled_list_is_named_as_such_and_does_not_abort_the_crawl(
+    tmp_path: Path, farm: FakeFarm, transport: Transport
+) -> None:
+    crawler = _as_2010(_crawler(tmp_path, transport, download_files=False))
+    farm.fail_on["GetListItems"] = "soap_fault_threshold.xml"
+
+    report = crawler.crawl()
+
+    assert report.throttled_lists == [f"{WEB1} :: Servicefälle"]
+    assert report.lists_failed == 1
+    assert report.lists_succeeded == 5  # the rest of the farm still lands
+
+
+def test_a_normal_fault_is_not_reported_as_throttling(
+    tmp_path: Path, farm: FakeFarm, transport: Transport
+) -> None:
+    crawler = _as_2010(_crawler(tmp_path, transport, download_files=False))
+    farm.fail_on["GetListItems"] = "soap_fault.xml"
+    report = crawler.crawl()
+    assert report.throttled_lists == []
+    assert report.lists_failed == 1
+
+
+def test_2010_uses_the_single_call_discovery_and_real_incremental_sync(
+    tmp_path: Path, farm: FakeFarm, transport: Transport
+) -> None:
+    crawler = _as_2010(_crawler(tmp_path, transport, download_files=False))
+    crawler.crawl()
+
+    assert crawler.report.web_discovery_method == "GetAllSubWebCollection"
+
+    syncer = _as_2010(_crawler(tmp_path, transport, download_files=False))
+    syncer.state.update(CASES, change_token="1;3;primed")
+    syncer.sync()
+
+    # Real incremental sync, not the pre-WSS3 full-crawl fallback.
+    assert farm.count("GetListItemChangesSinceToken") > 0
+    assert syncer.report.items_deleted == 1

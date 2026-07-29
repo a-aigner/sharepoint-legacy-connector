@@ -412,3 +412,59 @@ def test_json_default_renders_datetimes_as_utc_zulu() -> None:
     assert json_default(datetime(2009, 3, 14, 8, 11)) == "2009-03-14T08:11:00Z"
     with pytest.raises(TypeError):
         json_default(object())
+
+
+# --------------------------------------------------------------------------- #
+# SharePoint 2010 field types
+# --------------------------------------------------------------------------- #
+
+TERM = "9f8e7d6c-1234-5678-9abc-def012345678"
+TERM2 = "11112222-3333-4444-5555-666677778888"
+
+
+def test_managed_metadata_splits_label_from_term_guid() -> None:
+    # The term GUID is the durable identity; labels are language-specific and
+    # get renamed, which is exactly the trap a German farm sets.
+    assert decode_value("TaxonomyFieldType", f"3;#Reparatur|{TERM}") == {
+        "id": 3,
+        "value": "Reparatur",
+        "term_guid": TERM,
+    }
+
+
+def test_managed_metadata_multi() -> None:
+    raw = f"3;#Reparatur|{TERM};#7;#Garantie|{TERM2}"
+    assert decode_value("TaxonomyFieldTypeMulti", raw) == [
+        {"id": 3, "value": "Reparatur", "term_guid": TERM},
+        {"id": 7, "value": "Garantie", "term_guid": TERM2},
+    ]
+
+
+def test_managed_metadata_label_containing_a_pipe_is_not_mangled() -> None:
+    assert decode_value("TaxonomyFieldType", "3;#Kulanz | Sonstiges") == {
+        "id": 3,
+        "value": "Kulanz | Sonstiges",
+        "term_guid": None,
+    }
+
+
+def test_managed_metadata_umlauts_survive() -> None:
+    result = decode_value("TaxonomyFieldType", f"3;#Prüfung Süd|{TERM}")
+    assert result == {"id": 3, "value": "Prüfung Süd", "term_guid": TERM}
+
+
+@pytest.mark.parametrize("field_type", ["TaxonomyFieldType", "TaxonomyFieldTypeMulti"])
+def test_managed_metadata_empty(field_type: str) -> None:
+    assert decode_value(field_type, "") in (None, [])
+
+
+def test_taxonomy_term_guid_must_actually_look_like_a_guid() -> None:
+    assert decode_value("TaxonomyFieldType", "3;#Label|not-a-guid")["term_guid"] is None
+
+
+@pytest.mark.parametrize(
+    ("field_type", "raw", "expected"),
+    [("RatingCount", "12", 12), ("AverageRating", "3.5", 3.5), ("ModStat", "0", 0)],
+)
+def test_other_2010_types(field_type: str, raw: str, expected: object) -> None:
+    assert decode_value(field_type, raw) == expected

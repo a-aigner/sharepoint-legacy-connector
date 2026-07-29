@@ -9,6 +9,7 @@ that finishes overnight and one that does not finish.
 
 from __future__ import annotations
 
+import importlib
 import re
 import ssl
 import threading
@@ -22,11 +23,64 @@ from requests.adapters import HTTPAdapter
 from requests.auth import HTTPBasicAuth
 from tenacity import RetryCallState, Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from .config import Settings, get_logger
+from .config import Settings, get_logger, register_secret
+from .trace import BodyTrace
 
 log = get_logger(__name__)
 
 RETRYABLE_STATUS = frozenset({500, 502, 503, 504})
+
+REDACTED_HEADER = "***REDACTED***"
+
+#: Headers safe to log verbatim. This is an **allowlist**: anything not named
+#: here is redacted. A denylist cannot cover a header nobody thought of — a
+#: reverse proxy's own ``X-Forwarded-Authorization``, a vendor token — and the
+#: failure mode of guessing wrong is a credential sitting in a log file.
+LOGGABLE_HEADERS = frozenset(
+    {
+        "accept",
+        "accept-encoding",
+        "cache-control",
+        "content-encoding",
+        "content-length",
+        "content-type",
+        "date",
+        "etag",
+        "expires",
+        "last-modified",
+        "location",
+        "microsoftsharepointteamservices",
+        "server",
+        "soapaction",
+        "transfer-encoding",
+        "user-agent",
+        "x-powered-by",
+    }
+)
+
+#: Known-sensitive names, kept for reporting. The allowlist above is the control.
+SENSITIVE_HEADERS = frozenset({"authorization", "cookie", "set-cookie", "proxy-authorization"})
+
+
+def redact_headers(headers: Any) -> dict[str, str]:
+    """Redact every header not explicitly known to be safe.
+
+    ``WWW-Authenticate`` is special-cased down to its scheme names: the value
+    can carry a Negotiate/GSSAPI token, but the schemes are the diagnostic part
+    and the reason the auth probe exists.
+    """
+    out: dict[str, str] = {}
+    for key, value in dict(headers).items():
+        lowered = key.lower()
+        if lowered in LOGGABLE_HEADERS:
+            out[key] = value
+        elif lowered == "www-authenticate":
+            out[key] = ", ".join(_parse_auth_schemes(str(value))) or REDACTED_HEADER
+        else:
+            out[key] = REDACTED_HEADER
+    return out
+
+
 VERSION_HEADER = "MicrosoftSharePointTeamServices"
 
 #: Major build number -> human product name.
@@ -40,8 +94,51 @@ SHAREPOINT_PRODUCTS = {
 }
 
 
+#: Providers tried, in order, for ``SP_AUTH_MODE=integrated``. Each is optional
+#: and platform-specific, so they are imported lazily and a clear install hint is
+#: raised if none is present.
+INTEGRATED_PROVIDERS: tuple[tuple[str, str, str], ...] = (
+    ("requests_negotiate_sspi", "HttpNegotiateAuth", "spconnect[windows]"),
+    ("requests_gssapi", "HTTPSPNEGOAuth", "spconnect[kerberos]"),
+    ("requests_kerberos", "HTTPKerberosAuth", "spconnect[kerberos]"),
+)
+
+
 class TransportError(Exception):
     """Base class for transport-level failures."""
+
+
+class IntegratedAuthUnavailable(TransportError):
+    """``SP_AUTH_MODE=integrated`` was requested but no provider is installed."""
+
+
+def build_integrated_auth() -> Any:
+    """Authenticate as the *current process identity*. No password anywhere.
+
+    Windows SSPI first (the common case on a domain-joined box), then Kerberos
+    via an existing ticket. Returns a ``requests`` auth object.
+    """
+    attempted: list[str] = []
+    for module_name, class_name, extra in INTEGRATED_PROVIDERS:
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            attempted.append(f"{module_name} (install: pip install '{extra}')")
+            continue
+        factory = getattr(module, class_name, None)
+        if factory is None:  # pragma: no cover - provider API drift
+            attempted.append(f"{module_name}.{class_name} missing")
+            continue
+        log.info("auth.integrated", provider=f"{module_name}.{class_name}")
+        return factory()
+
+    raise IntegratedAuthUnavailable(
+        "SP_AUTH_MODE=integrated needs a platform auth provider, none of which is installed:\n  "
+        + "\n  ".join(attempted)
+        + "\nOn a domain-joined Windows box: pip install 'spconnect[windows]', then run the "
+        "crawl as the service account. With a Kerberos ticket: pip install 'spconnect[kerberos]' "
+        "and kinit first."
+    )
 
 
 class AuthenticationError(TransportError):
@@ -84,13 +181,101 @@ class ServerVersion:
         """``GetListItemChangesSinceToken`` arrived with WSS 3.0 (major 12)."""
         return self.major is not None and self.major >= 12
 
+    @property
+    def supports_all_sub_web_collection(self) -> bool:
+        """``Webs.GetAllSubWebCollection`` also arrived with WSS 3.0.
+
+        Unknown versions get the benefit of the doubt: try the fast path, and
+        fall back if the server disagrees.
+        """
+        return self.major is None or self.major >= 12
+
+    @property
+    def has_list_view_threshold(self) -> bool:
+        """The 5000-item list view threshold arrived with SharePoint 2010 (major 14).
+
+        WSS 3.0 had no such limit: large lists were slow but never blocked.
+        """
+        return self.major is not None and self.major >= 14
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "raw": self.raw,
             "major": self.major,
+            "has_list_view_threshold": self.has_list_view_threshold,
             "product": self.product,
             "supports_change_tokens": self.supports_change_tokens,
+            "supports_all_sub_web_collection": self.supports_all_sub_web_collection,
         }
+
+
+@dataclass(frozen=True)
+class AuthProbe:
+    """What the server offers an *unauthenticated* request.
+
+    "We only need a username and password" describes NTLM and Basic equally
+    well — both take exactly that, they just transmit it differently. The only
+    reliable discriminator is the ``WWW-Authenticate`` header on a 401, so ask
+    the server rather than guess.
+    """
+
+    status: int | None
+    schemes: list[str]
+    forms_login_url: str | None = None
+    error: str | None = None
+
+    @property
+    def suggested_mode(self) -> str | None:
+        """The ``SP_AUTH_MODE`` this server appears to want, or ``None``."""
+        lowered = {s.lower() for s in self.schemes}
+        if "ntlm" in lowered or "negotiate" in lowered:
+            return "ntlm"
+        if "basic" in lowered:
+            return "basic"
+        if self.forms_login_url:
+            return None  # forms-based auth is out of scope
+        if self.status is not None and self.status < 400:
+            return "anonymous"
+        return None
+
+    @property
+    def advice(self) -> str:
+        if self.error:
+            return f"could not determine ({self.error})"
+        if self.forms_login_url:
+            return (
+                f"forms-based auth (redirects to {self.forms_login_url}). "
+                "NOT SUPPORTED by this connector — that is a follow-up."
+            )
+        if not self.schemes:
+            if self.status is not None and self.status < 400:
+                return "server answered without a challenge; SP_AUTH_MODE=anonymous may work"
+            return "server sent no WWW-Authenticate header"
+        offered = ", ".join(self.schemes)
+        mode = self.suggested_mode
+        note = ""
+        if {s.lower() for s in self.schemes} == {"negotiate"}:
+            note = " (Kerberos only — NTLM may be refused; report this)"
+        return f"{offered} -> SP_AUTH_MODE={mode}{note}"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "schemes": self.schemes,
+            "forms_login_url": self.forms_login_url,
+            "suggested_mode": self.suggested_mode,
+            "error": self.error,
+        }
+
+
+def _parse_auth_schemes(header: str) -> list[str]:
+    """``'Negotiate, NTLM, Basic realm="x"'`` -> ``['Negotiate', 'NTLM', 'Basic']``."""
+    schemes: list[str] = []
+    for part in header.split(","):
+        token = part.strip().split(" ", 1)[0].strip()
+        if token and token.lower() not in {s.lower() for s in schemes}:
+            schemes.append(token)
+    return schemes
 
 
 class RateLimiter:
@@ -160,9 +345,18 @@ class Transport:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        if settings.needs_password:
+            # Registered before any request, so the scrubber can strip it from
+            # every log line. In `integrated` mode there is nothing to register.
+            register_secret(settings.password.get_secret_value(), username=settings.username)
         self.limiter = RateLimiter(settings.requests_per_second)
         self.session = self._build_session(settings)
         self.server_version: ServerVersion | None = None
+        self.request_count = 0
+        self.bytes_received = 0
+        self.trace = (
+            BodyTrace(settings.resolved_trace_file, settings.log_body_chars) if settings.log_bodies else None
+        )
 
     # ---- session construction ----
 
@@ -192,17 +386,27 @@ class Transport:
         session.mount("https://", adapter)
         session.mount("http://", HTTPAdapter(pool_connections=pool, pool_maxsize=pool))
 
-        if settings.auth_mode == "ntlm":
+        if settings.auth_mode == "integrated":
+            # No credential material enters this process at all.
+            session.auth = build_integrated_auth()
+        elif settings.auth_mode == "ntlm":
             from requests_ntlm import HttpNtlmAuth
 
             session.auth = HttpNtlmAuth(settings.username, settings.password.get_secret_value())
         elif settings.auth_mode == "basic":
+            log.warning(
+                "auth.basic",
+                detail="Basic sends the password on every request. Prefer SP_AUTH_MODE=integrated, "
+                "or ntlm, which never transmits it.",
+            )
             session.auth = HTTPBasicAuth(settings.username, settings.password.get_secret_value())
         else:
             session.auth = None
         return session
 
     def close(self) -> None:
+        if self.trace is not None:
+            self.trace.close()
         self.session.close()
 
     def __enter__(self) -> Transport:
@@ -231,7 +435,23 @@ class Transport:
         )
 
     def _send(self, method: str, url: str, *, stream: bool = False, **kwargs: Any) -> requests.Response:
+        self.request_count += 1
+        sequence = self.request_count
+        body = kwargs.get("data")
+        log.debug(
+            "http.request",
+            seq=sequence,
+            method=method,
+            url=url,
+            request_bytes=len(body) if isinstance(body, bytes | str) else None,
+            headers=redact_headers(kwargs.get("headers") or {}),
+        )
+        if self.trace is not None and isinstance(body, bytes | str):
+            self.trace.write(sequence, "REQUEST", f"{method} {url}", body)
+
+        waited = time.monotonic()
         self.limiter.acquire()
+        throttled = time.monotonic() - waited
         started = time.monotonic()
         try:
             response = self.session.request(
@@ -245,7 +465,22 @@ class Transport:
             raise RetryableTransportError(f"{type(exc).__name__} for {url}: {exc}") from exc
 
         duration = round(time.monotonic() - started, 3)
-        log.debug("http.response", method=method, url=url, status=response.status_code, duration=duration)
+        size = None if stream else len(response.content)
+        if size:
+            self.bytes_received += size
+        log.debug(
+            "http.response",
+            seq=sequence,
+            method=method,
+            url=url,
+            status=response.status_code,
+            duration=duration,
+            rate_limit_wait=round(throttled, 3) if throttled > 0.001 else None,
+            response_bytes=size,
+            content_type=response.headers.get("Content-Type"),
+        )
+        if self.trace is not None and not stream:
+            self.trace.write(sequence, "RESPONSE", f"HTTP {response.status_code} {url}", response.content)
 
         if response.status_code in (401, 403):
             raise AuthenticationError(
@@ -290,6 +525,38 @@ class Transport:
             yield response
         finally:
             response.close()
+
+    # ---- auth probe ----
+
+    def probe_auth_schemes(self, url: str | None = None) -> AuthProbe:
+        """Ask the server which HTTP auth schemes it offers, sending no credentials.
+
+        Deliberately bypasses the retry/401 machinery: here a 401 is the answer,
+        not a failure.
+        """
+        target = url or self.settings.base_url
+        saved_auth = self.session.auth
+        self.session.auth = None
+        try:
+            self.limiter.acquire()
+            response = self.session.get(target, timeout=self.settings.timeout_seconds, allow_redirects=False)
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            return AuthProbe(status=None, schemes=[], error=f"{type(exc).__name__}: {exc}")
+        finally:
+            self.session.auth = saved_auth
+
+        schemes = _parse_auth_schemes(response.headers.get("WWW-Authenticate", ""))
+
+        forms_login: str | None = None
+        location = response.headers.get("Location", "")
+        if response.is_redirect and "login.aspx" in location.lower():
+            forms_login = location
+        elif response.status_code == 200 and b"login.aspx" in response.content[:8192].lower():
+            forms_login = target
+
+        probe = AuthProbe(status=response.status_code, schemes=schemes, forms_login_url=forms_login)
+        log.info("auth_probe", status=probe.status, schemes=schemes, suggested=probe.suggested_mode)
+        return probe
 
     # ---- version probe ----
 

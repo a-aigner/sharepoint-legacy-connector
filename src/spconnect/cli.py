@@ -15,14 +15,18 @@ import typer
 
 from . import __version__
 from .config import Settings, get_logger, load_settings, setup_logging
-from .crawl import CrawlAborted, Crawler, RunReport
+from .console import StepReporter, format_bytes
+from .crawl import LIST_VIEW_THRESHOLD, THRESHOLD_ADVICE, CrawlAborted, Crawler, RunReport
 from .landing import LandingZone
 from .models import ListSchema
 from .schema import graph_summary, render_dot, render_mermaid
+from .services.lists import ListsService, is_system_list
+from .services.odata import ODataService
 from .services.sitedata import SiteDataService
 from .services.webs import WebsService
+from .soap import SoapResponseError
 from .state import StateStore
-from .transport import AuthenticationError, Transport
+from .transport import AuthenticationError, AuthProbe, IntegratedAuthUnavailable, Transport
 
 log = get_logger(__name__)
 
@@ -102,6 +106,22 @@ def main(
     ] = None,
     download_files: Annotated[bool | None, typer.Option("--download-files/--no-download-files")] = None,
     page_size: Annotated[int | None, typer.Option("--page-size", help="Override SP_PAGE_SIZE.")] = None,
+    api_mode: Annotated[
+        str | None,
+        typer.Option("--api-mode", help="soap | odata — which API fetches list items."),
+    ] = None,
+    verbose: Annotated[
+        int,
+        typer.Option(
+            "--verbose",
+            "-v",
+            count=True,
+            help="-v: DEBUG logging (every HTTP request). -vv: also log request/response bodies.",
+        ),
+    ] = 0,
+    quiet: Annotated[
+        bool, typer.Option("--quiet", "-q", help="Suppress the step-by-step narration.")
+    ] = False,
     version: Annotated[bool, typer.Option("--version", help="Print the version and exit.")] = False,
 ) -> None:
     if version:
@@ -121,7 +141,14 @@ def main(
         "include_document_libraries": include_document_libraries,
         "download_files": download_files,
         "page_size": page_size,
+        "api_mode": api_mode,
     }
+    if verbose >= 1:
+        overrides["log_level"] = "DEBUG"
+    if verbose >= 2:
+        overrides["log_bodies"] = True
+    if quiet:
+        overrides["show_steps"] = False
     settings = load_settings(env_file=env_file, overrides=overrides)
     if landing_dir is not None:
         # An overridden landing zone takes its state file with it.
@@ -137,39 +164,141 @@ def main(
 
 @app.command()
 def probe(ctx: typer.Context) -> None:
-    """Auth check, server version, and one trivial call. Nonzero exit on failure."""
+    """Auth check, server version, and one trivial call, narrated step by step.
+
+    Exits nonzero on failure. Every step names what it is about to try before
+    trying it, so a hang is attributable rather than mysterious.
+    """
     context = _ctx(ctx)
     settings = context.settings
-    echo(f"Base URL   : {settings.base_url}")
-    echo(f"Auth mode  : {settings.auth_mode} (user: {settings.username or '<none>'})")
+    steps = StepReporter(enabled=settings.show_steps and settings.log_format != "json", total=8)
+
+    steps.heading(f"spconnect probe -> {settings.base_url}")
+    if settings.auth_mode == "integrated":
+        steps.info("auth mode   : integrated (current process identity — no password stored)")
+    else:
+        steps.info(f"auth mode   : {settings.auth_mode} (user: {settings.username or '<none>'})")
+    steps.info(f"item source : SP_API_MODE={settings.api_mode}")
+    steps.info(
+        f"legacy TLS  : {'on' if settings.allow_legacy_tls else 'off'}, "
+        f"verify SSL {'on' if settings.verify_ssl else 'off'}"
+    )
+    steps.info(f"rate limit  : {settings.requests_per_second}/s")
+    if settings.log_bodies:
+        steps.info(f"body trace  : {settings.resolved_trace_file} (mode 0600)")
+    echo("")
+
+    auth: AuthProbe | None = None
+    version = None
+    webs: list[Any] = []
 
     try:
-        version = context.transport.probe_version()
-        echo(f"Server     : {version.raw or 'no version header'} -> {version.product}")
+        with steps.step("Reach the server (no credentials)") as st:
+            auth = context.transport.probe_auth_schemes()
+            if auth.error:
+                raise ConnectionError(auth.error)
+            st.detail(f"HTTP {auth.status}")
 
-        webs = WebsService(context.transport, settings.base_url).get_all_sub_web_collection()
-        echo(f"Webs       : {len(webs)} readable by this credential")
-        for web in webs[:10]:
-            echo(f"             - {web.url}  {web.title}")
-        if len(webs) > 10:
-            echo(f"             … and {len(webs) - 10} more")
+        with steps.step("Determine authentication scheme") as st:
+            st.detail(auth.advice)
+            if auth.suggested_mode and auth.suggested_mode != settings.auth_mode:
+                st.note(
+                    f"NOTE: SP_AUTH_MODE is '{settings.auth_mode}' but the server offers "
+                    f"'{auth.suggested_mode}'. If the next step fails, try that."
+                )
 
-        ok, detail = SiteDataService(context.transport, settings.base_url).reachable()
-        echo(f"SiteData   : {'reachable' if ok else 'unreachable'}{f' ({detail})' if detail else ''}")
+        identity = (
+            "the current process identity"
+            if settings.auth_mode == "integrated"
+            else (settings.username or "<anonymous>")
+        )
+        with steps.step(f"Authenticate as {identity}") as st:
+            version = context.transport.probe_version()
+            st.detail("login successful")
+            if settings.auth_mode == "basic":
+                st.note("Basic transmits the password on every request. Prefer integrated or ntlm.")
 
-        if not version.supports_change_tokens:
-            echo("")
-            echo("WARNING: this build predates change tokens; `spconnect sync` will do full crawls.")
-        echo("")
-        echo("OK")
-    except AuthenticationError as exc:
-        echo(f"\nAUTH FAILED: {exc}")
+        with steps.step("Read server build number") as st:
+            st.detail(version.raw or "no version header")
+            st.note(f"product: {version.product}")
+            if not version.supports_change_tokens:
+                st.note("This build predates change tokens; `sync` will do full crawls.")
+            if version.has_list_view_threshold:
+                st.note(f"{LIST_VIEW_THRESHOLD}-item list view threshold applies on this build.")
+
+        with steps.step("Enumerate webs") as st:
+            discovery = WebsService(context.transport, settings.base_url).discover_all_webs(
+                prefer_recursive_call=version.supports_all_sub_web_collection
+            )
+            webs = discovery.webs
+            st.detail(f"{len(webs)} readable via {discovery.method}")
+            for web in webs[:10]:
+                st.note(f"- {web.url}  {web.title}")
+            if len(webs) > 10:
+                st.note(f"… and {len(webs) - 10} more")
+            for warning in discovery.warnings:
+                st.note(f"NOTE: {warning}")
+            st.note("If this count looks low, the credential lacks permissions somewhere.")
+
+        with steps.step("List inventory on the first web") as st:
+            lists = ListsService(context.transport, webs[0].url).get_list_collection()
+            business = [li for li in lists if not is_system_list(li) and not li.hidden]
+            st.detail(f"{len(lists)} lists, {len(business)} in scope")
+            for info in sorted(business, key=lambda li: -li.item_count)[:10]:
+                flags = " [unique-scopes]" if info.has_unique_scopes else ""
+                st.note(f"{info.item_count:>8,}  {info.title} ({info.base_type_name}){flags}")
+
+        with steps.step("SiteData liveness") as st:
+            ok, detail = SiteDataService(context.transport, settings.base_url).reachable()
+            st.detail("reachable" if ok else "unreachable")
+            if detail:
+                st.note(detail)
+
+        with steps.step("ListData.svc (REST backend)") as st:
+            rest_ok, rest_detail = ODataService(context.transport, settings.base_url).available()
+            st.detail("available" if rest_ok else "unavailable")
+            st.note(str(rest_detail))
+            if rest_ok and webs:
+                for line in _entity_set_mapping(context, webs[0].url):
+                    st.note(line)
+            elif settings.api_mode == "odata":
+                st.note("SP_API_MODE=odata but REST is unavailable; every list would fall back to SOAP.")
+
+    except IntegratedAuthUnavailable as exc:
+        steps.done()
+        echo(f"\n{exc}")
         raise typer.Exit(2) from exc
+    except AuthenticationError as exc:
+        steps.done()
+        echo(f"\nAUTH FAILED: {exc}")
+        if auth and auth.suggested_mode and auth.suggested_mode != settings.auth_mode:
+            echo(f"Try SP_AUTH_MODE={auth.suggested_mode} — that is what this server offers.")
+        elif settings.auth_mode == "ntlm" and "\\" not in settings.username:
+            echo("NTLM usually wants DOMAIN\\username. Yours has no domain part.")
+        if settings.auth_mode in ("ntlm", "basic"):
+            echo("Consider SP_AUTH_MODE=integrated — it needs no password at all.")
+        raise typer.Exit(2) from exc
+    except SoapResponseError as exc:
+        steps.done()
+        saved = exc.save_body(settings.landing_dir / "_last_bad_response.xml")
+        echo(f"\nFull response body written to {saved}")
+        raise typer.Exit(1) from exc
     except Exception as exc:
-        echo(f"\nFAILED: {type(exc).__name__}: {exc}")
+        steps.done()
+        echo("\nRe-run with -vv to see the full request and response.")
         raise typer.Exit(1) from exc
     finally:
+        echo("")
+        echo(
+            f"{context.transport.request_count} HTTP requests, "
+            f"{format_bytes(context.transport.bytes_received)} received"
+        )
+        trace = context.transport.trace
+        if trace is not None and trace.entries:
+            echo(f"{trace.entries} bodies captured to {trace.path} (mode 0600)")
         context.close()
+
+    steps.done("PROBE OK — the connector can read this farm.")
 
 
 # --------------------------------------------------------------------------- #
@@ -411,6 +540,35 @@ def stats(ctx: typer.Context) -> None:
 # --------------------------------------------------------------------------- #
 
 
+def _entity_set_mapping(context: Context, web_url: str) -> list[str]:
+    """How list titles survive ListData.svc's entity-set sanitiser.
+
+    Names are derived from titles — spaces dropped, words capitalised, non-ASCII
+    mangled — so on a German farm this is the thing to eyeball before trusting
+    the REST backend.
+    """
+    try:
+        odata = ODataService(context.transport, web_url)
+        lists = [
+            li
+            for li in ListsService(context.transport, web_url).get_list_collection()
+            if not is_system_list(li) and not li.hidden
+        ]
+    except Exception as exc:
+        return [f"(could not compare list titles: {exc})"]
+
+    lines: list[str] = []
+    unmapped: list[str] = []
+    for info in lists[:15]:
+        entity = odata.entity_set_for(info.title)
+        lines.append(f"{'->' if entity else '!!'} {info.title!r} -> {entity or 'NO MATCH'}")
+        if not entity:
+            unmapped.append(info.title)
+    if unmapped:
+        lines.append(f"{len(unmapped)} list(s) have no REST entity set; those fall back to SOAP.")
+    return lines
+
+
 def _print_dry_run(plan: dict[str, Any]) -> None:
     echo("DRY RUN — nothing was fetched beyond discovery.\n")
     echo(f"{'ITEMS':>10}  {'PAGES':>6}  {'REQ':>8}  LIST")
@@ -440,6 +598,23 @@ def _print_unique_scope_list(entries: list[str]) -> None:
     )
 
 
+def _print_threshold_warning(report: RunReport) -> None:
+    if report.throttled_lists:
+        echo("")
+        echo("ERROR: these lists were throttled by the SharePoint 2010 list view threshold:")
+        for entry in report.throttled_lists[:20]:
+            echo(f"  - {entry}")
+        echo(THRESHOLD_ADVICE.format(threshold=LIST_VIEW_THRESHOLD))
+    elif report.large_lists:
+        echo("")
+        echo(f"NOTE: {len(report.large_lists)} list(s) hold more than {LIST_VIEW_THRESHOLD:,} items:")
+        for entry in report.large_lists[:10]:
+            echo(f"  - {entry}")
+        if len(report.large_lists) > 10:
+            echo(f"  … and {len(report.large_lists) - 10} more")
+        echo("They crawled fine — ID-based paging seeks the index rather than scanning.")
+
+
 def _print_unique_scope_warning(report: RunReport) -> None:
     if report.unique_scope_lists:
         echo("")
@@ -462,7 +637,14 @@ def _print_summary(report: RunReport, crawler: Crawler) -> None:
     for reason, count in sorted(report.skip_reasons.items()):
         echo(f"      {reason:<16} {count}")
     echo(f"  decoder warnings   : {report.decoder_warnings:,}")
+    if report.large_lists:
+        echo(f"  over 5000 items    : {len(report.large_lists)} list(s)")
+    if report.throttled_lists:
+        echo(f"  throttled by 2010  : {len(report.throttled_lists)} list(s)")
+    if report.odata_fallbacks:
+        echo(f"  REST -> SOAP       : {len(report.odata_fallbacks)} list(s) fell back")
     echo(f"  dangling lookups   : {report.dangling_edges}")
+    echo(f"  item source        : {crawler.settings.api_mode}")
     echo(f"  landing zone       : {crawler.landing.root}")
     echo(f"  manifest           : {crawler.landing.manifest_path}")
 
@@ -480,6 +662,7 @@ def _print_summary(report: RunReport, crawler: Crawler) -> None:
         for warning in report.warnings[:20]:
             echo(f"  - {warning}")
 
+    _print_threshold_warning(report)
     _print_unique_scope_warning(report)
 
 

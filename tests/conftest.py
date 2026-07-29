@@ -9,6 +9,7 @@ would happily pass a crawler that sent nonsense.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -99,9 +100,17 @@ class FakeFarm:
     def __init__(self, mock: responses.RequestsMock) -> None:
         self.mock = mock
         self.requests: list[ParsedRequest] = []
+        self.odata_requests: list[str] = []
         self.item_responses: dict[tuple[str, int], str] = {}
         self.changes_fixture = "lists_getlistitemchangessincetoken.xml"
         self.fail_on: dict[str, Exception | str] = {}
+        #: Operations that always fail, e.g. to simulate a WSS 2.0 build where
+        #: GetAllSubWebCollection does not exist.
+        self.always_fail: dict[str, str] = {}
+        #: ListData.svc behaviour: None = serve fixtures, or a fixture name to
+        #: return instead (e.g. an HTML 404 for a farm without the feature).
+        self.odata_broken: str | None = None
+        self.odata_broken_status: int = 404
         self._install()
 
     # ---- routing tables ----
@@ -148,6 +157,8 @@ class FakeFarm:
             body=b"\xff\xd8\xff\xe0JPEG-ish bytes",
             status=200,
         )
+        self._install_odata()
+
         for url, payload in {
             "http://sp/sites/service/Lists/Cases/Attachments/3/Prüfprotokoll.pdf": b"%PDF-1.4 protokoll",
             "http://sp/sites/service/Lists/Cases/Attachments/3/messwerte.csv": b"a;b\n1;2\n",
@@ -155,9 +166,45 @@ class FakeFarm:
         }.items():
             self.mock.add(responses.GET, url, body=payload, status=200)
 
+    def _install_odata(self) -> None:
+        for web in (WEB1, WEB2):
+            self.mock.add_callback(
+                responses.GET,
+                re.compile(re.escape(f"{web}/_vti_bin/ListData.svc") + r".*"),
+                callback=self._dispatch_odata,
+                content_type="application/json",
+            )
+
+    def _dispatch_odata(self, request: Any) -> tuple[int, dict[str, str], str]:
+        url = request.url
+        self.odata_requests.append(url)
+        if self.odata_broken:
+            body = fixture(self.odata_broken)
+            return self.odata_broken_status, {"Content-Type": "text/html"}, body
+
+        path = url.split("/ListData.svc", 1)[1]
+        query = path.split("?", 1)[1] if "?" in path else ""
+        entity = path.split("?", 1)[0].strip("/")
+
+        if not entity:
+            return 200, {"Content-Type": "application/json"}, fixture("odata_service_document.json")
+        if "Servicef" not in entity:
+            return 200, {"Content-Type": "application/json"}, fixture("odata_empty.json")
+        # Page on the same Id filter the SOAP backend uses.
+        match = re.search(r"Id%20gt%20(\d+)", query) or re.search(r"Id gt (\d+)", query)
+        last_id = int(match.group(1)) if match else 0
+        name = {0: "odata_cases_page1.json", 2: "odata_cases_page2.json"}.get(last_id, "odata_empty.json")
+        return 200, {"Content-Type": "application/json"}, fixture(name)
+
     def _dispatch(self, request: Any) -> tuple[int, dict[str, str], str]:
         parsed = ParsedRequest(request.body, request.headers.get("SOAPAction"))
         self.requests.append(parsed)
+
+        always = self.always_fail.get(parsed.operation)
+        if always is not None:
+            body = fixture(always) if always.endswith((".xml", ".html")) else always
+            status = 200 if always.endswith(".html") else 500
+            return status, {"Content-Type": "text/xml"}, body
 
         failure = self.fail_on.get(parsed.operation)
         if failure is not None:
@@ -174,6 +221,11 @@ class FakeFarm:
         op = parsed.operation
         if op == "GetAllSubWebCollection":
             return fixture("webs_getallsubwebcollection.xml")
+        if op == "GetWebCollection":
+            # Immediate children only — the WSS 2.0 shape.
+            if web == WEB1:
+                return fixture("webs_getwebcollection_root.xml")
+            return fixture("webs_getwebcollection_empty.xml")
         if op == "GetSiteAndWeb":
             return (
                 '<?xml version="1.0" encoding="utf-8"?>'

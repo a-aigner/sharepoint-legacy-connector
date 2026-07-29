@@ -223,3 +223,111 @@ def test_legacy_tls_adapter_is_mounted_only_when_asked(tmp_path: Path) -> None:
 def test_transport_closes_cleanly(tmp_path: Path) -> None:
     with Transport(make_settings(tmp_path)) as tp:
         assert tp.session is not None
+
+
+# --------------------------------------------------------------------------- #
+# auth scheme probe
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("header", "schemes", "mode"),
+    [
+        ("NTLM", ["NTLM"], "ntlm"),
+        ("Negotiate, NTLM", ["Negotiate", "NTLM"], "ntlm"),
+        ('Basic realm="SharePoint"', ["Basic"], "basic"),
+        ('Negotiate, NTLM, Basic realm="x"', ["Negotiate", "NTLM", "Basic"], "ntlm"),
+        ("Negotiate", ["Negotiate"], "ntlm"),
+        ("NTLM, ntlm", ["NTLM"], "ntlm"),
+    ],
+)
+def test_auth_probe_reads_the_offered_schemes(
+    rsps, tp: Transport, header: str, schemes: list[str], mode: str
+) -> None:
+    rsps.add(responses.GET, WEB1, status=401, headers={"WWW-Authenticate": header})
+    probe = tp.probe_auth_schemes()
+    assert probe.schemes == schemes
+    assert probe.suggested_mode == mode
+    assert probe.status == 401
+
+
+def test_auth_probe_sends_no_credentials_and_restores_session_auth(rsps, tmp_path: Path) -> None:
+    tp = Transport(make_settings(tmp_path, auth_mode="basic", username="u", password="p"))
+    rsps.add(responses.GET, WEB1, status=401, headers={"WWW-Authenticate": "NTLM"})
+
+    before = tp.session.auth
+    tp.probe_auth_schemes()
+
+    assert "Authorization" not in rsps.calls[0].request.headers
+    assert tp.session.auth is before  # the real credential survives the probe
+
+
+def test_auth_probe_detects_anonymous(rsps, tp: Transport) -> None:
+    rsps.add(responses.GET, WEB1, status=200, body="<html>hello</html>")
+    probe = tp.probe_auth_schemes()
+    assert probe.schemes == []
+    assert probe.suggested_mode == "anonymous"
+    assert "anonymous" in probe.advice
+
+
+def test_auth_probe_detects_forms_based_auth_by_redirect(rsps, tp: Transport) -> None:
+    rsps.add(
+        responses.GET,
+        WEB1,
+        status=302,
+        headers={"Location": "http://sp/_layouts/login.aspx?ReturnUrl=%2f"},
+    )
+    probe = tp.probe_auth_schemes()
+    assert probe.forms_login_url is not None
+    assert probe.suggested_mode is None
+    assert "NOT SUPPORTED" in probe.advice
+
+
+def test_auth_probe_detects_forms_based_auth_by_body(rsps, tp: Transport) -> None:
+    rsps.add(responses.GET, WEB1, status=200, body='<form action="/_layouts/login.aspx">')
+    probe = tp.probe_auth_schemes()
+    assert probe.forms_login_url is not None
+    assert probe.suggested_mode is None
+
+
+def test_auth_probe_survives_an_unreachable_server(rsps, tp: Transport) -> None:
+    rsps.add(responses.GET, WEB1, body=requests.ConnectionError("no route to host"))
+    probe = tp.probe_auth_schemes()
+    assert probe.status is None
+    assert probe.error is not None
+    assert "could not determine" in probe.advice
+    assert probe.suggested_mode is None
+
+
+def test_kerberos_only_is_called_out(rsps, tp: Transport) -> None:
+    rsps.add(responses.GET, WEB1, status=401, headers={"WWW-Authenticate": "Negotiate"})
+    assert "Kerberos only" in tp.probe_auth_schemes().advice
+
+
+def test_auth_probe_is_manifest_ready(rsps, tp: Transport) -> None:
+    rsps.add(responses.GET, WEB1, status=401, headers={"WWW-Authenticate": "NTLM"})
+    assert tp.probe_auth_schemes().as_dict()["suggested_mode"] == "ntlm"
+
+
+def test_parse_auth_schemes_handles_a_header_with_parameters() -> None:
+    from spconnect.transport import _parse_auth_schemes
+
+    assert _parse_auth_schemes('Basic realm="SharePoint", Negotiate') == ["Basic", "Negotiate"]
+    assert _parse_auth_schemes("") == []
+    assert _parse_auth_schemes("   ") == []
+
+
+@pytest.mark.parametrize(
+    ("major", "throttled"), [(6, False), (12, False), (14, True), (15, True), (16, True), (None, False)]
+)
+def test_list_view_threshold_arrived_with_2010(major: int | None, throttled: bool) -> None:
+    version = ServerVersion(raw=f"{major}.0.0.0" if major else None, major=major)
+    assert version.has_list_view_threshold is throttled
+    assert version.as_dict()["has_list_view_threshold"] is throttled
+
+
+def test_sharepoint_2010_supports_everything_the_crawler_needs() -> None:
+    version = ServerVersion(raw="14.0.4762.1000", major=14)
+    assert version.product == "SharePoint 2010"
+    assert version.supports_change_tokens is True
+    assert version.supports_all_sub_web_collection is True

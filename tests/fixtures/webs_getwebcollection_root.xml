@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <soap:Body>
+    <GetWebCollectionResponse xmlns="http://schemas.microsoft.com/sharepoint/soap/">
+      <GetWebCollectionResult>
+        <Webs xmlns="http://schemas.microsoft.com/sharepoint/soap/">
+          <Web Title="Fälle 2008" Url="http://sp/sites/service/cases2008"/>
+        </Webs>
+      </GetWebCollectionResult>
+    </GetWebCollectionResponse>
+  </soap:Body>
+</soap:Envelope>

@@ -1,0 +1,19 @@
+{"d": {"results": [
+  {
+    "__metadata": {"uri": "x(3)", "type": "Microsoft.SharePoint.DataService.ServicefälleItem"},
+    "Id": 3,
+    "Title": "Getriebe Straßenbahn — Nachtrag",
+    "CaseNumber": "SF-2011-0117",
+    "Kunde": {"__metadata": {"uri": "x"}, "Id": 42, "Title": "Müller Maschinenbau GmbH"},
+    "KundeId": 42,
+    "Kategorie": {"results": ["Kulanz & Sonstiges"]},
+    "Beschreibung": "Nachtrag zu SF-2009-0001",
+    "Kosten": "87.9000000000000",
+    "Erledigt": false,
+    "Eingegangen": "/Date(1309471200000)/",
+    "Prioritaet": "Mittel",
+    "Meldungen": null,
+    "Created": "/Date(1309471200000)/",
+    "Modified": "/Date(1309500720000)/"
+  }
+]}}

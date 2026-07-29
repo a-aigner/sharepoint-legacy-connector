@@ -39,6 +39,7 @@ from .models import (
 )
 from .schema import build_lookup_graph, viewfields_names
 from .services.lists import ChangeBatch, ItemPage, ListsService, is_system_list
+from .services.odata import ODataError, ODataRowMapper, ODataService
 from .services.webs import WebsService
 from .soap import SharePointSoapFault
 from .state import StateStore, utcnow
@@ -47,6 +48,18 @@ from .transport import AuthenticationError, ServerVersion, Transport
 log = get_logger(__name__)
 
 MAX_SYNC_PAGES = 500
+
+#: SharePoint 2010+ throttles queries that must examine more than this many rows.
+#: Our ID-based paging is index-seekable and normally slips under it; recursive
+#: queries over big document libraries are the ones that still trip.
+LIST_VIEW_THRESHOLD = 5000
+
+THRESHOLD_ADVICE = (
+    "SharePoint 2010 throttles list queries at {threshold} items. spconnect pages on the "
+    "indexed ID column, which normally avoids this. If a list still fails, ask the farm "
+    "admin to raise the threshold, to add an index, or to schedule the crawl inside the "
+    "daily unthrottled window."
+)
 
 
 class CrawlAborted(Exception):
@@ -59,6 +72,7 @@ class RunReport:
 
     started_at: datetime = field(default_factory=utcnow)
     webs_discovered: int = 0
+    web_discovery_method: str = "GetAllSubWebCollection"
     lists_discovered: int = 0
     lists_in_scope: int = 0
     lists_succeeded: int = 0
@@ -74,6 +88,9 @@ class RunReport:
     errors: list[CrawlError] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     unique_scope_lists: list[str] = field(default_factory=list)
+    large_lists: list[str] = field(default_factory=list)
+    throttled_lists: list[str] = field(default_factory=list)
+    odata_fallbacks: list[str] = field(default_factory=list)
     skip_reasons: dict[str, int] = field(default_factory=dict)
 
     def record_error(self, error: CrawlError) -> None:
@@ -152,6 +169,7 @@ class Crawler:
         self.report = report or RunReport()
         self.downloader = FileDownloader(transport, settings)
         self._lists_services: dict[str, ListsService] = {}
+        self._odata_services: dict[str, ODataService] = {}
         self.server_version: ServerVersion | None = transport.server_version
 
     # ---- services ----
@@ -197,17 +215,25 @@ class Crawler:
 
     def discover(self) -> tuple[list[WebRef], dict[str, list[ListInfo]]]:
         """Enumerate webs and their in-scope lists. Writes ``webs.json``."""
-        self.ensure_version()
+        version = self.ensure_version()
         webs_service = WebsService(self.transport, self.settings.base_url)
-        all_webs = webs_service.get_all_sub_web_collection()
+        discovery = webs_service.discover_all_webs(
+            prefer_recursive_call=version.supports_all_sub_web_collection
+        )
+        all_webs = discovery.webs
         self.report.webs_discovered = len(all_webs)
+        self.report.web_discovery_method = discovery.method
+        self.report.warnings.extend(discovery.warnings)
+        for url in discovery.unreadable:
+            self.report.warnings.append(f"could not enumerate subwebs of {url}; some webs may be missing")
 
         webs = [w for w in all_webs if self.web_in_scope(w)]
         log.info(
             "discover.webs",
             discovered=len(all_webs),
             in_scope=len(webs),
-            detail="GetAllSubWebCollection returns only what this credential can read",
+            method=discovery.method,
+            detail="web discovery returns only what this credential can read",
         )
 
         lists_by_web: dict[str, list[ListInfo]] = {}
@@ -230,10 +256,19 @@ class Crawler:
                     continue
                 if list_info.has_unique_scopes:
                     self.report.unique_scope_lists.append(f"{web.url} :: {list_info.title}")
+                if version.has_list_view_threshold and list_info.item_count > LIST_VIEW_THRESHOLD:
+                    self.report.large_lists.append(
+                        f"{web.url} :: {list_info.title} ({list_info.item_count:,} items)"
+                    )
                 in_scope.append(list_info)
             lists_by_web[web.url] = in_scope
             self.landing.write_web(web, in_scope)
 
+        if self.report.large_lists:
+            self.report.warnings.append(
+                f"{len(self.report.large_lists)} list(s) exceed the {LIST_VIEW_THRESHOLD}-item "
+                "SharePoint 2010 list view threshold; see large_lists"
+            )
         self.report.lists_in_scope = sum(len(v) for v in lists_by_web.values())
         self.landing.ensure()
         self.landing.write_webs(webs, lists_by_web)
@@ -280,6 +315,48 @@ class Crawler:
         self.landing.write_graph(graph)
         return graph
 
+    # ---- item sources ----
+
+    def odata_service(self, web_url: str) -> ODataService:
+        key = normalise_url(web_url)
+        service = self._odata_services.get(key)
+        if service is None:
+            service = ODataService(self.transport, key)
+            self._odata_services[key] = service
+        return service
+
+    def _odata_page(
+        self,
+        list_info: ListInfo,
+        schema: ListSchema,
+        entity_set: str,
+        last_id: int,
+        mapper: ODataRowMapper,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int | None]:
+        """One OData page, returned as ``(raw_rows, decoded_rows, max_id)``."""
+        service = self.odata_service(list_info.web_url)
+        expand = (
+            [f.name for f in schema.fields if f.is_lookup][:12]
+            if self.settings.odata_expand_lookups
+            else None
+        )
+        try:
+            page = service.get_items(entity_set, last_id=last_id, top=self.settings.page_size, expand=expand)
+        except ODataError:
+            if not expand:
+                raise
+            # Wide $expand is a known way to make a 2010 farm return 500.
+            log.warning("odata.expand_failed", list=list_info.title, detail="retrying without $expand")
+            page = service.get_items(entity_set, last_id=last_id, top=self.settings.page_size)
+
+        raw_rows: list[dict[str, Any]] = []
+        decoded_rows: list[dict[str, Any]] = []
+        for entity in page.rows:
+            raw, decoded = mapper.map_row(entity)
+            raw_rows.append(raw)
+            decoded_rows.append(decoded)
+        return raw_rows, decoded_rows, page.max_id
+
     # ---- 3. items ----
 
     def crawl_list(self, list_info: ListInfo, schema: ListSchema, resume: bool = False) -> int:
@@ -323,41 +400,71 @@ class Crawler:
         service = self.lists_service(list_info.web_url)
         display_names = schema.display_names()
 
+        entity_set: str | None = None
+        mapper: ODataRowMapper | None = None
+        if self.settings.api_mode == "odata":
+            entity_set = self.odata_service(list_info.web_url).entity_set_for(list_info.title)
+            if entity_set is None:
+                # No entity set means no REST path for this list. Falling back is
+                # strictly better than skipping it.
+                self.report.warnings.append(
+                    f"{list_info.title}: no ListData.svc entity set found; used SOAP for this list"
+                )
+                self.report.odata_fallbacks.append(f"{list_info.web_url} :: {list_info.title}")
+            else:
+                mapper = ODataRowMapper(schema)
+
         writer.open()
         try:
             page_number = 0
             while True:
-                page: ItemPage = service.get_list_items(
-                    guid,
-                    last_id=last_id,
-                    row_limit=self.settings.page_size,
-                    field_names=field_names,
-                )
+                if entity_set is not None and mapper is not None:
+                    raw_rows, decoded_rows, max_id = self._odata_page(
+                        list_info, schema, entity_set, last_id, mapper
+                    )
+                    rows = raw_rows
+                else:
+                    page: ItemPage = service.get_list_items(
+                        guid,
+                        last_id=last_id,
+                        row_limit=self.settings.page_size,
+                        field_names=field_names,
+                    )
+                    rows = page.rows
+                    decoded_rows = []
+                    max_id = page.max_id
                 page_number += 1
-                rows = page.rows
                 if not rows:
                     break
 
-                max_id = page.max_id
                 if max_id is None or max_id <= last_id:
                     raise RuntimeError(
                         f"paging stalled on '{list_info.title}': page {page_number} returned "
                         f"{len(rows)} rows with max ID {max_id} <= last ID {last_id}"
                     )
 
-                written += self._write_page(writer, rows, list_info, decoder, display_names)
+                written += self._write_page(
+                    writer,
+                    rows,
+                    list_info,
+                    decoder,
+                    display_names,
+                    decoded_rows if entity_set is not None else None,
+                )
                 last_id = max_id
                 self.state.update(guid, last_item_id=last_id, items_written=written, status="in_progress")
                 self.state.save()
 
+                total = list_info.item_count or 0
+                percent = f"{100 * written / total:.0f}%" if total else "?"
                 log.info(
                     "crawl.page",
                     list=list_info.title,
                     page=page_number,
                     rows=len(rows),
-                    written=written,
-                    total=list_info.item_count or None,
+                    progress=f"{written:,}/{total:,} ({percent})" if total else f"{written:,}",
                     last_id=last_id,
+                    source="odata" if entity_set else "soap",
                 )
 
                 if len(rows) < self.settings.page_size:
@@ -380,21 +487,31 @@ class Crawler:
     def _write_page(
         self,
         writer: ListWriter,
-        rows: list[dict[str, str]],
+        rows: list[dict[str, Any]],
         list_info: ListInfo,
         decoder: RowDecoder,
         display_names: dict[str, str],
+        decoded_rows: list[dict[str, Any]] | None = None,
     ) -> int:
+        """Write one page. ``decoded_rows`` short-circuits the ``ows_`` decoder
+        for the OData backend, which delivers typed values already."""
         written = 0
-        for raw in rows:
+        for index, raw in enumerate(rows):
             item_id = coerce_item_id(raw)
             if item_id is None:
                 log.warning("crawl.row_without_id", list=list_info.title)
                 continue
-            decoded = decoder.decode_row(raw)
+            decoded = decoded_rows[index] if decoded_rows is not None else decoder.decode_row(raw)
+            log.debug(
+                "crawl.item",
+                list=list_info.title,
+                item_id=item_id,
+                fields=len(decoded),
+                title=decoded.get("Title"),
+            )
             record = self._build_record(list_info, item_id, decoded, display_names)
             record.attachments = self._collect_files(writer, list_info, item_id, raw, decoded)
-            writer.write(record, strip_ows(raw))
+            writer.write(record, strip_ows(raw) if decoded_rows is None else raw)
             written += 1
             self.report.items_written += 1
         return written
@@ -536,6 +653,8 @@ class Crawler:
                     raise CrawlAborted(str(exc)) from exc
                 except Exception as exc:
                     self.report.lists_failed += 1
+                    if isinstance(exc, SharePointSoapFault) and exc.is_list_view_threshold:
+                        self.report.throttled_lists.append(f"{web_url} :: {list_info.title}")
                     self.state.update(list_info.guid, status="failed", error=str(exc))
                     self.state.save()
                     self._record_error(
@@ -838,6 +957,8 @@ class Crawler:
             finished_at=utcnow(),
             base_url=self.settings.base_url,
             server_version=version.as_dict() if version else {},
+            web_discovery_method=self.report.web_discovery_method,
+            api_mode=self.settings.api_mode,
             config=self.settings.redacted_dict(),
             counts=self.report.counts(),
             warnings=self.report.warnings,

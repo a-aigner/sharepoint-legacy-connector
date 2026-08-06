@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <GetGroupCollectionFromUserResponse xmlns="http://schemas.microsoft.com/sharepoint/soap/directory/">
+      <GetGroupCollectionFromUserResult>
+        <GetGroupCollectionFromUser>
+          <Groups>
+            <Group ID="4" Name="Servicefälle Besucher" Description="Read-only" OwnerID="1" OwnerIsUser="False" />
+            <Group ID="7" Name="CRM Leser" Description="" OwnerID="1" OwnerIsUser="False" />
+          </Groups>
+        </GetGroupCollectionFromUser>
+      </GetGroupCollectionFromUserResult>
+    </GetGroupCollectionFromUserResponse>
+  </soap:Body>
+</soap:Envelope>

@@ -21,6 +21,7 @@ def env_file(tmp_path: Path) -> Path:
     path.write_text(
         f"SP_BASE_URL={WEB1}\n"
         "SP_AUTH_MODE=anonymous\n"
+        "SP_USERNAME=pkober\n"
         "SP_PASSWORD=supersecret\n"
         "SP_ALLOW_LEGACY_TLS=false\n"
         "SP_REQUESTS_PER_SECOND=10000\n"
@@ -343,3 +344,54 @@ def test_probe_does_not_suggest_anonymous_for_a_redirecting_farm(tmp_path: Path,
     # And it stops rather than narrating four more steps against a dead URL.
     assert "Enumerate webs" not in result.stdout
     assert "Read server build number" not in result.stdout
+
+
+# --------------------------------------------------------------------------- #
+# permissions
+# --------------------------------------------------------------------------- #
+
+
+def test_permissions_reports_declared_and_effective_access(env_file: Path, farm: FakeFarm) -> None:
+    result = run(env_file, "permissions")
+
+    assert result.exit_code == 0
+    assert "Servicefälle Besucher" in result.stdout  # declared groups
+    assert "Lesen" in result.stdout  # declared permission level
+    assert "lists readable" in result.stdout  # effective access
+    assert "Everything discovered is readable" in result.stdout
+
+
+def test_permissions_names_what_a_crawl_would_silently_omit(env_file: Path, farm: FakeFarm) -> None:
+    farm.always_fail["GetListItems"] = "usergroup_denied.xml"
+
+    result = run(env_file, "permissions")
+
+    assert result.exit_code == 0
+    assert "DENIED" in result.stdout
+    assert "would silently omit them" in result.stdout
+
+
+def test_permissions_says_so_when_the_server_will_not_disclose_them(env_file: Path, farm: FakeFarm) -> None:
+    farm.always_fail["GetGroupCollectionFromUser"] = "usergroup_denied.xml"
+    farm.always_fail["GetRoleCollectionFromUser"] = "usergroup_denied.xml"
+
+    result = run(env_file, "permissions")
+
+    assert result.exit_code == 0
+    assert "not permitted to say" in result.stdout
+    # The effective half needs no privilege, so it still answers.
+    assert "lists readable" in result.stdout
+
+
+def test_permissions_flags_item_level_scopes(env_file: Path, farm: FakeFarm) -> None:
+    result = run(env_file, "permissions")
+    assert "[unique-scopes]" in result.stdout
+    assert "item-level permissions" in result.stdout
+
+
+def test_permissions_json_is_machine_readable(env_file: Path, farm: FakeFarm) -> None:
+    result = run(env_file, "permissions", "--json")
+    payload = json.loads(result.stdout)
+    assert payload["complete"] is True
+    assert payload["declared"]["roles"] == ["Lesen"]
+    assert all("lists" in web for web in payload["webs"])

@@ -19,10 +19,12 @@ from .console import StepReporter, format_bytes
 from .crawl import LIST_VIEW_THRESHOLD, THRESHOLD_ADVICE, CrawlAborted, Crawler, RunReport
 from .landing import LandingZone
 from .models import ListSchema
+from .permissions import probe_access
 from .schema import graph_summary, render_dot, render_mermaid
 from .services.lists import ListsService, is_system_list
 from .services.odata import ODataService
 from .services.sitedata import SiteDataService
+from .services.usergroup import UserGroupService
 from .services.webs import WebsService
 from .soap import SoapResponseError
 from .state import StateStore
@@ -392,6 +394,135 @@ def probe(ctx: typer.Context) -> None:
         context.close()
 
     steps.done("PROBE OK — the connector can read this farm.")
+
+
+# --------------------------------------------------------------------------- #
+# permissions
+# --------------------------------------------------------------------------- #
+
+
+@app.command()
+def permissions(
+    ctx: typer.Context,
+    probe_items: Annotated[
+        bool,
+        typer.Option(
+            "--probe-items/--no-probe-items",
+            help="Read one row per list to prove readability. Off = inventory only.",
+        ),
+    ] = True,
+    as_json: Annotated[bool, typer.Option("--json", help="Machine-readable output.")] = False,
+) -> None:
+    """What this credential can actually read, web by web and list by list.
+
+    Answers "does the account have permissions" by trying, rather than by
+    asking: enumerating a principal's permissions is itself privileged, and the
+    read-only accounts this connector runs as usually cannot. Where the server
+    *is* willing to name the account's groups and roles, that is reported too.
+
+    Read-only. One list-collection call per web, one single-row read per list.
+    """
+    context = _ctx(ctx)
+    settings = context.settings
+    steps = StepReporter(enabled=settings.show_steps and not as_json, total=3)
+    steps.heading(f"spconnect permissions -> {settings.base_url}")
+    steps.info(f"identity    : {settings.username or 'the current process identity'}")
+    echo("")
+
+    try:
+        with steps.step("Enumerate webs") as st:
+            version = context.transport.probe_version()
+            discovery = WebsService(context.transport, settings.base_url).discover_all_webs(
+                prefer_recursive_call=version.supports_all_sub_web_collection
+            )
+            st.detail(f"{len(discovery.webs)} readable via {discovery.method}")
+
+        with steps.step("Ask the server what it grants this account") as st:
+            declared = UserGroupService(context.transport, settings.base_url).describe(settings.username)
+            if declared.known:
+                st.detail(f"groups: {', '.join(declared.groups) or 'none'}")
+                st.note(f"permission levels: {', '.join(declared.roles) or 'none'}")
+            else:
+                # Expected, not alarming: reading someone's permissions is a
+                # privilege in its own right, and the effective check below does
+                # not need it.
+                st.detail("not permitted to say")
+                for reason in declared.unavailable:
+                    st.note(reason)
+
+        with steps.step("Read one row from every list in scope") as st:
+            report = probe_access(context.transport, discovery.webs, probe_items=probe_items)
+            st.detail(f"{report.readable_lists}/{report.total_lists} lists readable")
+    except AuthenticationError as exc:
+        steps.done()
+        echo(f"\nAUTH FAILED: {exc}")
+        echo("\nPermissions cannot be assessed until the login works.")
+        raise typer.Exit(2) from exc
+    except Exception as exc:
+        steps.done()
+        echo(f"\nFAILED: {type(exc).__name__}: {exc}")
+        raise typer.Exit(1) from exc
+    finally:
+        if not as_json:
+            context.close()
+
+    if as_json:
+        echo(
+            _dump_json(
+                {
+                    "base_url": settings.base_url,
+                    "declared": {
+                        "login": declared.login,
+                        "groups": declared.groups,
+                        "roles": declared.roles,
+                        "unavailable": declared.unavailable,
+                    },
+                    "webs": [
+                        {
+                            "url": web.url,
+                            "readable": web.readable,
+                            "reason": web.reason,
+                            "lists": [vars(entry) for entry in web.lists],
+                        }
+                        for web in report.webs
+                    ],
+                    "complete": report.complete,
+                }
+            )
+        )
+        context.close()
+        return
+
+    steps.done()
+    echo("")
+    for web in report.webs:
+        if not web.readable:
+            echo(f"DENIED  {web.url}\n        {web.reason}")
+            continue
+        echo(f"{web.url}  ({len(web.readable_lists)}/{len(web.lists)} lists readable)")
+        for entry in sorted(web.lists, key=lambda li: (li.readable, -li.item_count)):
+            mark = "  ok    " if entry.readable else "  DENIED"
+            scopes = "  [unique-scopes]" if entry.has_unique_scopes else ""
+            echo(f"{mark} {entry.item_count:>8,}  {entry.title}{scopes}")
+            if entry.reason:
+                echo(f"           {entry.reason}")
+    echo("")
+
+    if report.complete:
+        echo("Everything discovered is readable by this credential.")
+    else:
+        echo(
+            f"{len(report.denied_webs)} web(s) and "
+            f"{report.total_lists - report.readable_lists} list(s) are not readable. "
+            "A crawl would silently omit them — grant Read, or scope them out explicitly."
+        )
+    if scoped := report.unique_scope_lists:
+        echo("")
+        echo(
+            f"{len(scoped)} list(s) have item-level permissions. Readable does not mean "
+            "complete there: rows this account cannot see are simply absent, and no "
+            "permission table above item level will show that."
+        )
 
 
 # --------------------------------------------------------------------------- #

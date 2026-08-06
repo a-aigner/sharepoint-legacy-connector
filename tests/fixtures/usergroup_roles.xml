@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <GetRoleCollectionFromUserResponse xmlns="http://schemas.microsoft.com/sharepoint/soap/directory/">
+      <GetRoleCollectionFromUserResult>
+        <GetRoleCollectionFromUser>
+          <Roles>
+            <Role ID="1073741826" Name="Lesen" Description="Kann anzeigen" Order="128" Type="Reader" />
+          </Roles>
+        </GetRoleCollectionFromUser>
+      </GetRoleCollectionFromUserResult>
+    </GetRoleCollectionFromUserResponse>
+  </soap:Body>
+</soap:Envelope>

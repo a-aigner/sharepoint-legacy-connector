@@ -194,6 +194,7 @@ Interrupt-safe. Resume with `spconnect crawl --resume`.
 | Command | What it does |
 |---|---|
 | `spconnect probe` | Eight-step connectivity and capability check. Nonzero exit on failure. |
+| `spconnect permissions [--json] [--no-probe-items]` | What this credential can actually read, web by web and list by list |
 | `spconnect discover` | Webs + lists inventory. No items. |
 | `spconnect schema` | `GetList` per in-scope list; writes `list.json`, rebuilds the graph |
 | `spconnect graph --format mermaid\|json\|dot [--out FILE]` | Emit the lookup graph from cached schemas |
@@ -201,6 +202,37 @@ Interrupt-safe. Resume with `spconnect crawl --resume`.
 | `spconnect sync` | Incremental update via change tokens, including deletes |
 | `spconnect verify-time --list X --item N` | Raw vs decoded datetime vs display URL |
 | `spconnect stats` | Summarise the landing zone on disk |
+
+### Checking what the account may read
+
+`spconnect permissions` answers "does this user have the right permissions" by
+**trying**, not by asking. Enumerating a principal's permissions is itself a
+privileged operation that a read-only service account usually cannot perform,
+so the command reports two things and trusts the second:
+
+* **Declared** — the groups and permission levels `UserGroup.asmx` will admit
+  to. Often `not permitted to say`, which is expected and not a problem.
+* **Effective** — one list-collection call per web and one single-row read per
+  list. This needs no privilege beyond what the crawl needs anyway, and is the
+  answer that matters: a role assignment overridden by broken inheritance
+  further down is not a permission the crawl can use.
+
+```
+http://sp/sites/service  (5/6 lists readable)
+  ok       12,481  Servicefälle  [unique-scopes]
+  DENIED        0  Personalakten
+           Zugriff verweigert.
+
+1 web(s) and 1 list(s) are not readable. A crawl would silently omit them —
+grant Read, or scope them out explicitly.
+```
+
+Run it after `probe` and before the first real crawl: an under-permissioned
+credential does not fail a crawl, it quietly produces a smaller one.
+
+`[unique-scopes]` means item-level permissions, where *readable* still does not
+mean *complete* — rows the account cannot see are simply absent, and no
+permission table above item level will reveal that.
 
 ### Global flags
 

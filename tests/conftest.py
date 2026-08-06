@@ -140,7 +140,7 @@ class FakeFarm:
 
     def _install(self) -> None:
         for web in (WEB1, WEB2):
-            for service in ("Webs", "Lists", "SiteData"):
+            for service in ("Webs", "Lists", "SiteData", "UserGroup"):
                 self.mock.add_callback(
                     responses.POST,
                     f"{web}/_vti_bin/{service}.asmx",
@@ -246,6 +246,10 @@ class FakeFarm:
             return fixture(self.changes_fixture)
         if op == "GetAttachmentCollection":
             return fixture("lists_getattachmentcollection.xml")
+        if op == "GetGroupCollectionFromUser":
+            return fixture("usergroup_groups.xml")
+        if op == "GetRoleCollectionFromUser":
+            return fixture("usergroup_roles.xml")
         raise AssertionError(f"unexpected SOAP operation: {op!r}")
 
     # ---- assertions helpers ----

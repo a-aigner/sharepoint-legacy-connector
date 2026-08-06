@@ -9,9 +9,12 @@ that finishes overnight and one that does not finish.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import importlib
 import re
 import ssl
+import struct
 import threading
 import time
 from collections.abc import Iterator
@@ -152,6 +155,102 @@ class AuthenticationError(TransportError):
     """401/403. Never retried — a bad credential must fail fast and loudly."""
 
 
+NTLM_SIGNATURE = b"NTLMSSP\x00"
+
+#: A minimal NTLM *Type 1* (Negotiate) message, constant because it carries no
+#: identity: no username, no password, no workstation. Its only purpose is to
+#: make the server answer with a Type 2 challenge — and a Type 2 names the
+#: domain the server belongs to. Flags request Unicode, OEM, a target name, NTLM
+#: and extended session security (``0x00088207``), which is what every client
+#: sends and what every server of this era expects.
+NTLM_NEGOTIATE = base64.b64encode(NTLM_SIGNATURE + struct.pack("<II", 1, 0x00088207) + b"\x00" * 16).decode()
+
+#: AV-pair identifiers inside a Type 2 ``TargetInfo`` block (MS-NLMP 2.2.2.1).
+_AV_NB_COMPUTER, _AV_NB_DOMAIN, _AV_DNS_COMPUTER, _AV_DNS_DOMAIN = 1, 2, 3, 4
+
+
+@dataclass(frozen=True)
+class NtlmTarget:
+    """What the server volunteered about itself in an NTLM challenge."""
+
+    netbios_domain: str | None = None
+    dns_domain: str | None = None
+    netbios_computer: str | None = None
+    dns_computer: str | None = None
+
+    @property
+    def username_hint(self) -> str | None:
+        """The ``SP_USERNAME`` form this server is asking for."""
+        if self.netbios_domain:
+            return f"{self.netbios_domain}\\<user>"
+        if self.dns_domain:
+            return f"<user>@{self.dns_domain}"
+        return None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "netbios_domain": self.netbios_domain,
+            "dns_domain": self.dns_domain,
+            "netbios_computer": self.netbios_computer,
+            "dns_computer": self.dns_computer,
+        }
+
+
+def parse_ntlm_challenge(blob: bytes) -> NtlmTarget | None:
+    """Read the domain out of an NTLM Type 2 challenge.
+
+    Answers "what is our domain?" from the server itself, which matters because
+    the people who need ``DOMAIN\\user`` are routinely the ones who do not know
+    what ``DOMAIN`` is — and the server says so, unauthenticated, on any 401.
+
+    Hand-parsed rather than pulled from ``spnego``: this has to work in
+    ``basic`` and ``anonymous`` modes, where the NTLM stack is never loaded.
+    Every offset is bounds-checked because this is untrusted network input;
+    anything malformed yields ``None`` rather than an exception.
+    """
+    if len(blob) < 48 or not blob.startswith(NTLM_SIGNATURE):
+        return None
+    if struct.unpack_from("<I", blob, 8)[0] != 2:  # not a Challenge message
+        return None
+
+    flags = struct.unpack_from("<I", blob, 20)[0]
+    unicode_encoding = "utf-16-le" if flags & 0x1 else "latin-1"
+
+    def text_at(offset: int, length: int, encoding: str) -> str | None:
+        if length <= 0 or offset + length > len(blob):
+            return None
+        try:
+            return blob[offset : offset + length].decode(encoding).strip() or None
+        except (UnicodeDecodeError, LookupError):
+            return None
+
+    name_len, _, name_offset = struct.unpack_from("<HHI", blob, 12)
+    target_name = text_at(name_offset, name_len, unicode_encoding)
+
+    info_len, _, info_offset = struct.unpack_from("<HHI", blob, 40)
+    found: dict[int, str] = {}
+    cursor, end = info_offset, min(info_offset + info_len, len(blob))
+    while cursor + 4 <= end:
+        av_id, av_len = struct.unpack_from("<HH", blob, cursor)
+        cursor += 4
+        if av_id == 0 or cursor + av_len > end:  # MsvAvEOL, or a truncated pair
+            break
+        value = text_at(cursor, av_len, "utf-16-le")
+        if value:
+            found[av_id] = value
+        cursor += av_len
+
+    target = NtlmTarget(
+        # TargetName is the NetBIOS domain on a domain-joined server; the AV
+        # pair is authoritative when both are present.
+        netbios_domain=found.get(_AV_NB_DOMAIN) or target_name,
+        dns_domain=found.get(_AV_DNS_DOMAIN),
+        netbios_computer=found.get(_AV_NB_COMPUTER),
+        dns_computer=found.get(_AV_DNS_COMPUTER),
+    )
+    return target if any(target.as_dict().values()) else None
+
+
 def describe_auth_failure(response: requests.Response, *, auth_mode: str, username: str) -> str:
     """Everything a 401/403 can be made to say, in one block.
 
@@ -187,6 +286,25 @@ def describe_auth_failure(response: requests.Response, *, auth_mode: str, userna
         lines.append(f"  credential  : sent ({auth_mode}) over {legs} round trip(s)")
 
     if schemes:
+        offered = {s.lower() for s in schemes}
+        # "Basic" and "ntlm" name both a setting and a wire scheme; when the two
+        # disagree the credential was never in the running, and blaming the
+        # password sends the operator to reset an account that is fine.
+        wire_scheme = {"ntlm": "ntlm", "basic": "basic", "integrated": "negotiate"}.get(auth_mode)
+        if (
+            wire_scheme
+            and wire_scheme not in offered
+            and not (wire_scheme == "ntlm" and "negotiate" in offered)
+        ):
+            lines.append(
+                f"  server says : it does not offer {auth_mode} at all — only "
+                f"{', '.join(schemes)}. The credential was never tried."
+            )
+            lines.append(f"  check       : set SP_AUTH_MODE to match, e.g. {sorted(offered)[0]}")
+            if body := (response.text or "").strip():
+                lines.append(f"  body        : {body[:300]}")
+            return "\n".join(lines)
+
         lines.append(
             f"  server says : rejected it, and re-challenges with {', '.join(schemes)} "
             "— the credential itself was refused"
@@ -575,6 +693,11 @@ class Transport:
         self.version_probe_authenticated: bool | None = None
         self.request_count = 0
         self.bytes_received = 0
+        #: Requests the diagnostics send outside :meth:`_send` — the auth probe,
+        #: the NTLM domain lookup, the differential check. Counted separately so
+        #: the footer reports what actually left the process; a probe that says
+        #: "0 HTTP requests" after a round trip undermines every other number.
+        self.side_channel_requests = 0
         self.trace = (
             BodyTrace(settings.resolved_trace_file, settings.log_body_chars) if settings.log_bodies else None
         )
@@ -785,6 +908,7 @@ class Transport:
         self.session.auth = None
         try:
             self.limiter.acquire()
+            self.side_channel_requests += 1
             response = self.session.get(target, timeout=self.settings.timeout_seconds, allow_redirects=False)
         except (requests.ConnectionError, requests.Timeout) as exc:
             return AuthProbe(status=None, schemes=[], error=f"{type(exc).__name__}: {exc}")
@@ -816,6 +940,53 @@ class Transport:
         )
         return probe
 
+    def discover_ntlm_domain(self, url: str | None = None) -> NtlmTarget | None:
+        """Ask the server which domain it belongs to. Sends no credential.
+
+        One unauthenticated round trip: we offer an NTLM Type 1, the server
+        answers 401 with a Type 2, and the Type 2 names its domain. Works
+        whatever ``SP_AUTH_MODE`` is set to, because it bypasses the session's
+        auth handler entirely — which is the point, since the operator who needs
+        this is usually the one whose auth mode is wrong.
+
+        Returns ``None`` when the server does not offer NTLM or answers with
+        something unparseable. Never raises: this is a diagnostic.
+        """
+        target = url or self.settings.base_url
+        saved_auth = self.session.auth
+        self.session.auth = None
+        try:
+            self.limiter.acquire()
+            self.side_channel_requests += 1
+            response = self.session.get(
+                target,
+                timeout=self.settings.timeout_seconds,
+                allow_redirects=False,
+                headers={"Authorization": f"NTLM {NTLM_NEGOTIATE}"},
+            )
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            log.debug("ntlm_domain.unreachable", error=str(exc))
+            return None
+        finally:
+            self.session.auth = saved_auth
+
+        header = response.headers.get("WWW-Authenticate", "")
+        token = next(
+            (part.strip()[5:] for part in header.split(",") if part.strip().lower().startswith("ntlm ")),
+            None,
+        )
+        if not token:
+            return None
+        try:
+            blob = base64.b64decode(token, validate=True)
+        except (ValueError, binascii.Error):
+            return None
+
+        found = parse_ntlm_challenge(blob)
+        if found is not None:
+            log.info("ntlm_domain", **found.as_dict())
+        return found
+
     def _status_of(self, method: str, url: str) -> str:
         """Status of one authenticated request, as text. Never raises.
 
@@ -824,6 +995,7 @@ class Transport:
         """
         try:
             self.limiter.acquire()
+            self.side_channel_requests += 1
             response = self.session.request(
                 method, url, timeout=self.settings.timeout_seconds, allow_redirects=False
             )

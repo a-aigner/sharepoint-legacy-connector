@@ -168,6 +168,44 @@ def main(
 # --------------------------------------------------------------------------- #
 
 
+def _domain_notes(context: Context, settings: Settings, auth: AuthProbe | None) -> list[str]:
+    """What the server says its domain is, and whether SP_USERNAME agrees.
+
+    Worth an extra unauthenticated round trip because "use DOMAIN\\user" is
+    advice nobody can act on without knowing DOMAIN, and the people who hit this
+    are usually the ones who cannot find out — the server, meanwhile, will say.
+
+    Skipped unless the server offered a Windows scheme, so farms that never ask
+    for one do not pay for a question with no answer.
+    """
+    offered = {s.lower() for s in (auth.schemes if auth else [])}
+    if not offered & {"ntlm", "negotiate"}:
+        return []
+
+    target = context.transport.discover_ntlm_domain()
+    if target is None:
+        return []
+
+    known = ", ".join(
+        f"{label} {value}"
+        for label, value in (
+            ("NetBIOS domain:", target.netbios_domain),
+            ("DNS domain:", target.dns_domain),
+            ("host:", target.netbios_computer),
+        )
+        if value
+    )
+    notes = [f"server identifies as — {known}"]
+
+    user = settings.username
+    if target.username_hint and user and "\\" not in user and "@" not in user:
+        notes.append(
+            f"SP_USERNAME='{user}' has no domain. This server wants "
+            f"{target.username_hint.replace('<user>', user)}"
+        )
+    return notes
+
+
 @app.command()
 def probe(ctx: typer.Context) -> None:
     """Auth check, server version, and one trivial call, narrated step by step.
@@ -218,6 +256,8 @@ def probe(ctx: typer.Context) -> None:
                     f"NOTE: SP_AUTH_MODE is '{settings.auth_mode}' but the server offers "
                     f"'{auth.suggested_mode}'. If the next step fails, try that."
                 )
+            for line in _domain_notes(context, settings, auth):
+                st.note(line)
 
         identity = (
             "the current process identity"
@@ -299,7 +339,20 @@ def probe(ctx: typer.Context) -> None:
         # reproduce it by hand. On a customer site there may be exactly one
         # chance to run this.
         echo("")
-        for line in context.transport.diagnose_endpoint_auth(f"{settings.base_url}/_vti_bin/Webs.asmx"):
+        if auth is None or auth.suggested_mode in (None, settings.auth_mode):
+            for line in context.transport.diagnose_endpoint_auth(f"{settings.base_url}/_vti_bin/Webs.asmx"):
+                echo(line)
+        else:
+            # Every request would 401 for the same trivial reason, and the
+            # differential would read that as "no permissions anywhere". A
+            # confident wrong answer is worse than no answer.
+            echo(
+                f"Skipping the differential check: SP_AUTH_MODE={settings.auth_mode} is not what "
+                "this server offers, so every request fails the same way whatever the account "
+                "can read. Fix the auth mode first, then re-run."
+            )
+        echo("")
+        for line in _domain_notes(context, settings, auth):
             echo(line)
         echo("")
         if auth and auth.suggested_mode and auth.suggested_mode != settings.auth_mode:
@@ -327,9 +380,11 @@ def probe(ctx: typer.Context) -> None:
         raise typer.Exit(1) from exc
     finally:
         echo("")
+        diagnostics = context.transport.side_channel_requests
         echo(
-            f"{context.transport.request_count} HTTP requests, "
-            f"{format_bytes(context.transport.bytes_received)} received"
+            f"{context.transport.request_count + diagnostics} HTTP requests"
+            + (f" ({diagnostics} diagnostic)" if diagnostics else "")
+            + f", {format_bytes(context.transport.bytes_received)} received"
         )
         trace = context.transport.trace
         if trace is not None and trace.entries:

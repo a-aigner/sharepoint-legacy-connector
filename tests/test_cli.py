@@ -83,8 +83,15 @@ def test_probe_narrates_every_step_in_order(env_file: Path, farm: FakeFarm) -> N
 
 def test_probe_reports_request_count_and_bytes(env_file: Path, farm: FakeFarm) -> None:
     result = run(env_file, "probe")
-    assert "HTTP requests," in result.stdout
+    assert "HTTP requests" in result.stdout
     assert "received" in result.stdout
+
+
+def test_the_request_count_includes_the_diagnostic_round_trips(env_file: Path, farm: FakeFarm) -> None:
+    """The auth probe bypasses the counter, so the footer used to under-report it."""
+    result = run(env_file, "probe")
+    total = int(result.stdout.split(" HTTP requests")[0].rsplit("\n", 1)[-1])
+    assert total >= len(farm.mock.calls)
 
 
 def test_quiet_suppresses_the_narration(env_file: Path, farm: FakeFarm) -> None:

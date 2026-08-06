@@ -135,8 +135,19 @@ Then check, in order:
 
 1. **Double backslash.** `CONTOSO\\svc` in `.env` is read literally, with two
    backslashes. Write `CONTOSO\svc`.
-2. **Missing domain.** NTLM usually wants `DOMAIN\username`. The probe says so
-   if yours has no domain part.
+2. **Missing domain — and you do not know the domain.** Ask the server. When it
+   offers NTLM, the probe sends an identity-free Type 1 negotiate and reads the
+   domain out of the Type 2 challenge that comes back:
+
+   ```
+   server identifies as — NetBIOS domain: CONTOSO, DNS domain: contoso.local, host: SP2010
+   SP_USERNAME='svc' has no domain. This server wants CONTOSO\svc
+   ```
+
+   No credential is involved, so this works before you have a working login —
+   which is the point, since `DOMAIN\user` is unusable advice until you know
+   `DOMAIN`. Use the **NetBIOS** name for `DOMAIN\user`, or the DNS name for
+   `user@domain.tld`.
 3. **Account locked or password expired.** Test the same credential in a browser.
 4. **The account cannot read that specific web** — 403 rather than 401.
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import struct
 import time
 from pathlib import Path
 
@@ -21,6 +23,7 @@ from spconnect.transport import (
     Transport,
     _looks_like_soap_fault,
     describe_auth_failure,
+    parse_ntlm_challenge,
     redirect_target,
 )
 
@@ -506,3 +509,106 @@ def test_check_base_url_leaves_forms_auth_to_its_own_diagnosis(rsps, tp: Transpo
 def test_check_base_url_ignores_a_same_origin_redirect(rsps, tp: Transport) -> None:
     rsps.add(responses.GET, WEB1, status=302, headers={"Location": f"{WEB1}/default.aspx"})
     tp.check_base_url()  # must not raise
+
+
+# --------------------------------------------------------------------------- #
+# NTLM domain discovery
+#
+# "Use DOMAIN\user" is advice nobody can act on without knowing DOMAIN, and the
+# operators who hit it are usually the ones who cannot find out. The server will
+# say, unauthenticated, on any 401.
+# --------------------------------------------------------------------------- #
+
+
+def ntlm_challenge(
+    *,
+    netbios_domain: str | None = "CONTOSO",
+    dns_domain: str | None = "contoso.local",
+    computer: str | None = "SP2010",
+    unicode_flag: bool = True,
+) -> bytes:
+    """Build a Type 2 the way a domain-joined IIS does (MS-NLMP 2.2.1.2)."""
+    name = (netbios_domain or "").encode("utf-16-le")
+    pairs = b""
+    for av_id, value in ((2, netbios_domain), (1, computer), (4, dns_domain)):
+        if value:
+            encoded = value.encode("utf-16-le")
+            pairs += struct.pack("<HH", av_id, len(encoded)) + encoded
+    pairs += struct.pack("<HH", 0, 0)  # MsvAvEOL
+
+    name_offset = 48
+    info_offset = name_offset + len(name)
+    header = (
+        b"NTLMSSP\x00"
+        + struct.pack("<I", 2)
+        + struct.pack("<HHI", len(name), len(name), name_offset)
+        + struct.pack("<I", 0x00088205 if unicode_flag else 0x00088204)
+        + b"\x11" * 8  # server challenge
+        + b"\x00" * 8  # reserved
+        + struct.pack("<HHI", len(pairs), len(pairs), info_offset)
+    )
+    return header + name + pairs
+
+
+def test_the_domain_is_read_out_of_the_challenge() -> None:
+    target = parse_ntlm_challenge(ntlm_challenge())
+    assert target is not None
+    assert target.netbios_domain == "CONTOSO"
+    assert target.dns_domain == "contoso.local"
+    assert target.netbios_computer == "SP2010"
+    assert target.username_hint == "CONTOSO\\<user>"
+
+
+def test_a_server_with_only_a_dns_domain_still_gives_a_usable_hint() -> None:
+    target = parse_ntlm_challenge(ntlm_challenge(netbios_domain=None, computer=None))
+    assert target is not None
+    assert target.username_hint == "<user>@contoso.local"
+
+
+@pytest.mark.parametrize(
+    ("label", "blob"),
+    [
+        ("empty", b""),
+        ("not ntlm", b"<html>401</html>"),
+        ("truncated header", b"NTLMSSP\x00" + struct.pack("<I", 2) + b"\x00" * 8),
+        ("a Type 1, not a Type 2", b"NTLMSSP\x00" + struct.pack("<II", 1, 0) + b"\x00" * 40),
+        (
+            "offsets past the end",
+            b"NTLMSSP\x00" + struct.pack("<I", 2) + struct.pack("<HHI", 400, 400, 9999) + b"\x00" * 36,
+        ),
+    ],
+)
+def test_a_malformed_challenge_yields_none_rather_than_raising(label: str, blob: bytes) -> None:
+    assert parse_ntlm_challenge(blob) is None, label
+
+
+def test_discover_ntlm_domain_asks_the_server_without_credentials(rsps, tp: Transport) -> None:
+    token = base64.b64encode(ntlm_challenge()).decode()
+    rsps.add(responses.GET, WEB1, status=401, headers={"WWW-Authenticate": f"NTLM {token}"})
+
+    target = tp.discover_ntlm_domain()
+
+    assert target is not None and target.netbios_domain == "CONTOSO"
+    sent = rsps.calls[0].request.headers
+    assert sent["Authorization"].startswith("NTLM ")
+    # A Type 1 carries no identity — that is what makes this safe to run always.
+    assert base64.b64decode(sent["Authorization"][5:]).startswith(b"NTLMSSP\x00")
+
+
+def test_discover_ntlm_domain_is_quiet_when_the_server_does_not_offer_ntlm(rsps, tp: Transport) -> None:
+    rsps.add(responses.GET, WEB1, status=401, headers={"WWW-Authenticate": "Basic realm='x'"})
+    assert tp.discover_ntlm_domain() is None
+
+
+def test_the_configured_scheme_not_being_offered_is_named_as_such() -> None:
+    """SP_AUTH_MODE=basic against an NTLM-only server: the credential never ran."""
+    message = describe_auth_failure(a_401(challenge="NTLM"), auth_mode="basic", username="pkober")
+    assert "does not offer basic at all" in message
+    assert "never tried" in message
+    # Blaming the password here would send someone to reset an account that is fine.
+    assert "SP_PASSWORD" not in message
+
+
+def test_negotiate_counts_as_offering_ntlm() -> None:
+    message = describe_auth_failure(a_401(challenge="Negotiate"), auth_mode="ntlm", username="CONTOSO\\p")
+    assert "does not offer" not in message

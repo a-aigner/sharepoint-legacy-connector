@@ -17,6 +17,7 @@ import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -29,6 +30,11 @@ from .trace import BodyTrace
 log = get_logger(__name__)
 
 RETRYABLE_STATUS = frozenset({500, 502, 503, 504})
+
+#: Every status that moves a request elsewhere. SOAP POSTs refuse all of them,
+#: including the body-preserving 307/308 — a SOAP endpoint that is not where we
+#: were told it is means the base URL is wrong, and saying so beats guessing.
+REDIRECT_STATUS = frozenset({301, 302, 303, 307, 308})
 
 REDACTED_HEADER = "***REDACTED***"
 
@@ -161,6 +167,53 @@ class HttpError(TransportError):
 
 class RetryableTransportError(TransportError):
     """Signals the tenacity retry loop that another attempt is worthwhile."""
+
+
+class SoapRedirectError(TransportError):
+    """A SOAP POST was answered with a redirect, which silently destroys it.
+
+    ``requests`` follows 301/302/303 by rewriting the method to ``GET`` and
+    dropping the body along with ``Content-Type``. The redirected request
+    therefore arrives at ``*.asmx`` as a bodyless GET, and IIS answers it with
+    the ASMX service-description *page* — HTML with a 200 status. The SOAP layer
+    then reports a missing result element, which points at the wrong thing
+    entirely.
+
+    The tell is that GET-based checks keep working while every SOAP call fails:
+    the version probe redirects harmlessly, so the farm looks reachable right up
+    until the first real operation.
+
+    Never retried. A redirect here is a configuration fact, not a transient one.
+    """
+
+    def __init__(self, endpoint: str, status: int, location: str) -> None:
+        super().__init__(
+            f"{endpoint} answered HTTP {status} -> {location}\n  {self._advice(endpoint, location)}"
+        )
+        self.endpoint = endpoint
+        self.status = status
+        self.location = location
+
+    @staticmethod
+    def _advice(endpoint: str, location: str) -> str:
+        src, dst = urlsplit(endpoint), urlsplit(location)
+        if "login.aspx" in location.lower():
+            return (
+                "The target is a forms-authentication login page, which this connector "
+                "does not support. The farm must offer NTLM, Negotiate or Basic."
+            )
+        if dst.scheme and dst.scheme != src.scheme:
+            return (
+                f"The server redirects {src.scheme} to {dst.scheme}. Set SP_BASE_URL to "
+                f"{dst.scheme}://{dst.netloc or src.netloc} so SOAP is posted directly to "
+                "the scheme the farm actually serves."
+            )
+        if dst.netloc and dst.netloc != src.netloc:
+            return (
+                f"The server redirects to a different host ({dst.netloc}). Set SP_BASE_URL to "
+                "that host — most likely the farm's Alternate Access Mapping for this zone."
+            )
+        return "Point SP_BASE_URL at the redirect target so SOAP is posted there directly."
 
 
 @dataclass(frozen=True)
@@ -504,12 +557,20 @@ class Transport:
     # ---- convenience wrappers ----
 
     def post_soap(self, endpoint: str, body: bytes, soap_action: str) -> bytes:
-        """POST a SOAP envelope. Returns raw bytes; fault parsing lives in :mod:`soap`."""
+        """POST a SOAP envelope. Returns raw bytes; fault parsing lives in :mod:`soap`.
+
+        Redirects are refused rather than followed: see :class:`SoapRedirectError`
+        for why following one turns a SOAP call into an unrelated HTML page.
+        """
         headers = {
             "Content-Type": "text/xml; charset=utf-8",
             "SOAPAction": f'"{soap_action}"',
         }
-        response = self.request("POST", endpoint, data=body, headers=headers)
+        response = self.request("POST", endpoint, data=body, headers=headers, allow_redirects=False)
+        if response.status_code in REDIRECT_STATUS:
+            location = response.headers.get("Location", "<no Location header>")
+            log.error("soap.redirected", endpoint=endpoint, status=response.status_code, location=location)
+            raise SoapRedirectError(endpoint, response.status_code, location)
         return response.content
 
     def get(self, url: str, *, stream: bool = False) -> requests.Response:

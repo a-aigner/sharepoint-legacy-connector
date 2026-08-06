@@ -20,6 +20,7 @@ from spconnect.transport import (
     SoapRedirectError,
     Transport,
     _looks_like_soap_fault,
+    describe_auth_failure,
     redirect_target,
 )
 
@@ -75,8 +76,60 @@ def test_auth_failures_fail_fast_and_are_never_retried(rsps, tp: Transport, stat
     rsps.add(responses.POST, ENDPOINT, status=status)
     with pytest.raises(AuthenticationError) as excinfo:
         tp.post_soap(ENDPOINT, b"<x/>", "op")
-    assert "SP_USERNAME" in str(excinfo.value)
+    # tp runs SP_AUTH_MODE=anonymous, so nothing was sent — naming SP_USERNAME
+    # here would point at a setting that is not the problem.
+    assert "NONE SENT" in str(excinfo.value)
+    assert "SP_AUTH_MODE" in str(excinfo.value)
     assert len(rsps.calls) == 1
+
+
+def a_401(
+    *, challenge: str | None = None, sent_credential: bool = True, connection: str | None = None
+) -> requests.Response:
+    """A 401 shaped like the ones this farm returns, without the auth machinery."""
+    response = requests.Response()
+    response.status_code = 401
+    response.url = ENDPOINT
+    response._content = b""
+    if challenge:
+        response.headers["WWW-Authenticate"] = challenge
+    if connection:
+        response.headers["Connection"] = connection
+    request_headers = {"Authorization": "NTLM abc123"} if sent_credential else {}
+    response.request = requests.Request("POST", ENDPOINT, headers=request_headers).prepare()
+    return response
+
+
+def test_a_rejected_credential_says_so_and_names_the_settings() -> None:
+    message = describe_auth_failure(a_401(challenge="NTLM"), auth_mode="ntlm", username="pkober")
+    assert "re-challenges with NTLM" in message
+    assert "has no domain part" in message
+    assert "SP_USERNAME" in message
+
+
+def test_an_authorisation_failure_is_not_reported_as_a_bad_password() -> None:
+    """401 *without* a challenge means accepted-then-denied: a permissions problem.
+
+    This is the distinction the old message could not make, and the one that
+    decides whether the next hour goes to passwords or to permissions.
+    """
+    message = describe_auth_failure(a_401(), auth_mode="ntlm", username="CONTOSO\\pkober")
+    assert "likely ACCEPTED and then denied" in message
+    assert "permissions on this web, before SP_USERNAME" in message
+    assert "has no domain part" not in message
+
+
+def test_a_credential_that_never_left_the_process_says_so() -> None:
+    message = describe_auth_failure(a_401(sent_credential=False), auth_mode="anonymous", username="")
+    assert "NONE SENT" in message
+
+
+def test_a_closed_connection_is_called_out_for_ntlm() -> None:
+    message = describe_auth_failure(
+        a_401(challenge="NTLM", connection="close"), auth_mode="ntlm", username="CONTOSO\\p"
+    )
+    assert "Connection: close" in message
+    assert "authenticates the connection" in message
 
 
 def test_404_is_not_retried(rsps, tp: Transport) -> None:

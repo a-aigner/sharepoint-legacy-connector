@@ -20,6 +20,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import requests
+import urllib3
 from requests.adapters import HTTPAdapter
 from requests.auth import HTTPBasicAuth
 from tenacity import RetryCallState, Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
@@ -149,6 +150,75 @@ def build_integrated_auth() -> Any:
 
 class AuthenticationError(TransportError):
     """401/403. Never retried — a bad credential must fail fast and loudly."""
+
+
+def describe_auth_failure(response: requests.Response, *, auth_mode: str, username: str) -> str:
+    """Everything a 401/403 can be made to say, in one block.
+
+    "Check SP_USERNAME / SP_PASSWORD" is true of every possible cause and
+    therefore useless. These four facts separate the causes that actually
+    differ, and all of them are already on the response:
+
+    * **Did we send a credential at all?** No ``Authorization`` header means the
+      auth handler never ran — a configuration problem, not a rejection.
+    * **Did the server re-challenge?** A 401 *with* ``WWW-Authenticate`` means
+      the credential was rejected. A 401 *without* one generally means it was
+      accepted and then denied access — an authorisation problem, so no amount
+      of password-fixing will help.
+    * **How many round trips?** NTLM needs three. One means the handshake never
+      got started; two means it broke halfway.
+    * **Did the server close the connection?** NTLM authenticates a *connection*,
+      so a close mid-handshake fails it regardless of the credential.
+    """
+    request_headers = getattr(response.request, "headers", {}) or {}
+    sent = "authorization" in {k.lower() for k in request_headers}
+    challenge = response.headers.get("WWW-Authenticate", "")
+    schemes = _parse_auth_schemes(challenge)
+    legs = len(response.history) + 1
+
+    lines = [f"HTTP {response.status_code} for {response.url}"]
+
+    if not sent:
+        lines.append(
+            f"  credential  : NONE SENT — no Authorization header left this process. "
+            f"SP_AUTH_MODE={auth_mode} did not attach one."
+        )
+    else:
+        lines.append(f"  credential  : sent ({auth_mode}) over {legs} round trip(s)")
+
+    if schemes:
+        lines.append(
+            f"  server says : rejected it, and re-challenges with {', '.join(schemes)} "
+            "— the credential itself was refused"
+        )
+        if auth_mode == "ntlm" and username and "\\" not in username and "@" not in username:
+            lines.append(
+                f"  username    : '{username}' has no domain part. NTLM usually needs "
+                "DOMAIN\\user (NetBIOS) or user@domain.tld."
+            )
+        lines.append("  check       : SP_USERNAME / SP_PASSWORD / SP_AUTH_MODE")
+    elif sent:
+        lines.append(
+            "  server says : no WWW-Authenticate challenge on the rejection — the login "
+            "was likely ACCEPTED and then denied access. This reads as a permissions "
+            "problem on this resource, not a wrong password."
+        )
+        lines.append("  check       : the account's permissions on this web, before SP_USERNAME")
+    else:
+        lines.append("  server says : no WWW-Authenticate challenge")
+        lines.append(f"  check       : SP_AUTH_MODE is '{auth_mode}' — the server wanted a credential")
+
+    if response.headers.get("Connection", "").lower() == "close":
+        lines.append(
+            "  connection  : server sent 'Connection: close'. NTLM authenticates the "
+            "connection, so a close mid-handshake fails it whatever the credential is."
+        )
+
+    body = (response.text or "").strip()
+    if body:
+        lines.append(f"  body        : {body[:300]}")
+
+    return "\n".join(lines)
 
 
 class NotFoundError(TransportError):
@@ -501,6 +571,8 @@ class Transport:
         self.limiter = RateLimiter(settings.requests_per_second)
         self.session = self._build_session(settings)
         self.server_version: ServerVersion | None = None
+        #: Set by :meth:`probe_version`: did the winning request carry a credential?
+        self.version_probe_authenticated: bool | None = None
         self.request_count = 0
         self.bytes_received = 0
         self.trace = (
@@ -519,6 +591,20 @@ class Transport:
             }
         )
         session.verify = settings.verify_ssl
+        if not settings.verify_ssl:
+            # urllib3 warns once per *request*, which on a narrated probe buries
+            # the narration in six identical paragraphs and makes a real warning
+            # impossible to spot. The fact is worth stating once, loudly, and it
+            # is already in the probe header and the log line below.
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            log.warning(
+                "tls.verification_disabled",
+                detail=(
+                    "SP_VERIFY_SSL=false — certificates are not checked and the connection "
+                    "is not protected against interception. Expected on a farm with a "
+                    "self-signed or expired certificate; set SP_VERIFY_SSL=true once it chains."
+                ),
+            )
 
         pool = max(settings.concurrency * 2, 4)
         if settings.allow_legacy_tls:
@@ -633,8 +719,11 @@ class Transport:
 
         if response.status_code in (401, 403):
             raise AuthenticationError(
-                f"HTTP {response.status_code} for {url}. Check SP_USERNAME / SP_PASSWORD / SP_AUTH_MODE "
-                "and that the account may read this web."
+                describe_auth_failure(
+                    response,
+                    auth_mode=self.settings.auth_mode,
+                    username=self.settings.username,
+                )
             )
         if response.status_code == 404:
             raise NotFoundError(f"HTTP 404 for {url}")
@@ -727,6 +816,77 @@ class Transport:
         )
         return probe
 
+    def _status_of(self, method: str, url: str) -> str:
+        """Status of one authenticated request, as text. Never raises.
+
+        Bypasses :meth:`_send` deliberately: there a 401 is an exception, and
+        here it is the measurement.
+        """
+        try:
+            self.limiter.acquire()
+            response = self.session.request(
+                method, url, timeout=self.settings.timeout_seconds, allow_redirects=False
+            )
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            return f"{type(exc).__name__}"
+        return str(response.status_code)
+
+    def diagnose_endpoint_auth(self, endpoint: str) -> list[str]:
+        """Separate "this credential is refused" from "this *request* is refused".
+
+        A 401 on a SOAP POST has three very different causes that look identical
+        from one request. Two extra bodyless GETs tell them apart:
+
+        =================  ================  ==============================================
+        GET site root      GET the endpoint  Reading
+        =================  ================  ==============================================
+        ok                 ok                The credential is fine here — the **POST**
+                                             is what fails. NTLM authenticates a
+                                             connection, and IIS often closes it when it
+                                             401s a request carrying a body, which fails
+                                             the handshake regardless of the password.
+        ok                 401               The account reaches the site but not
+                                             ``_vti_bin`` — permissions on the web
+                                             services, or a different auth provider
+                                             configured on that virtual directory.
+        401                401               The account cannot read this web at all.
+                                             A SharePoint permissions job, not a
+                                             connector one.
+        =================  ================  ==============================================
+
+        Read-only, three requests, and it runs where the failure happened rather
+        than asking the operator to reproduce it by hand.
+        """
+        root = self.settings.base_url
+        root_get = self._status_of("GET", root)
+        endpoint_get = self._status_of("GET", endpoint)
+
+        lines = [
+            "Differential check (the POST failed — do bodyless GETs?):",
+            f"  GET {root} -> HTTP {root_get}",
+            f"  GET {endpoint} -> HTTP {endpoint_get}",
+        ]
+
+        ok = {"200", "302", "301"}
+        if root_get in ok and endpoint_get in ok:
+            lines.append(
+                "  => The credential is accepted for both. Only the POST fails, which "
+                "points at the NTLM handshake over a request with a body rather than at "
+                "the account. Ask for Kerberos/Negotiate, or try SP_AUTH_MODE=integrated."
+            )
+        elif root_get in ok:
+            lines.append(
+                "  => The account reaches the site but not _vti_bin. Ask the SharePoint "
+                "admin whether the web services are restricted on this zone, and whether "
+                "the account has Read on the root web."
+            )
+        else:
+            lines.append(
+                "  => The account cannot read this web at all. This is a SharePoint "
+                "permissions question: grant it Read on the root web, then retry."
+            )
+        return lines
+
     def check_base_url(self, url: str | None = None) -> None:
         """Fail loudly when ``SP_BASE_URL`` is not where the farm answers.
 
@@ -761,6 +921,14 @@ class Transport:
                 response = self.request("GET", target, allow_redirects=True)
         except NotFoundError:
             response = self.request("GET", self.settings.base_url + "/_vti_bin/Lists.asmx")
+
+        # Whether the credential was actually exercised, as opposed to the
+        # request simply being allowed through. "login successful" asserted from
+        # a 2xx alone is a false green: anonymous-readable farms, and redirects
+        # to pages that need no login, both produce one without authenticating.
+        self.version_probe_authenticated = "authorization" in {
+            k.lower() for k in (getattr(response.request, "headers", {}) or {})
+        }
 
         raw = response.headers.get(VERSION_HEADER)
         major = None

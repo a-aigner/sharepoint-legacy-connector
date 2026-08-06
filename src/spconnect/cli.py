@@ -226,7 +226,19 @@ def probe(ctx: typer.Context) -> None:
         )
         with steps.step(f"Authenticate as {identity}") as st:
             version = context.transport.probe_version()
-            st.detail("login successful")
+            if settings.auth_mode == "anonymous":
+                st.detail("reached (anonymous — no credential configured)")
+            elif context.transport.version_probe_authenticated:
+                st.detail("login successful")
+            else:
+                # A 2xx alone does not prove the credential works — it may just
+                # mean this page needed no credential. Claiming otherwise sends
+                # the next failure looking in the wrong place.
+                st.detail("reached, but WITHOUT authenticating")
+                st.note(
+                    "NOTE: this page needed no credential, so the login is still unproven. "
+                    "The first step that requires one will be the real test."
+                )
             if settings.auth_mode == "basic":
                 st.note("Basic transmits the password on every request. Prefer integrated or ntlm.")
 
@@ -283,6 +295,13 @@ def probe(ctx: typer.Context) -> None:
     except AuthenticationError as exc:
         steps.done()
         echo(f"\nAUTH FAILED: {exc}")
+        # Gather the follow-up evidence here rather than asking the operator to
+        # reproduce it by hand. On a customer site there may be exactly one
+        # chance to run this.
+        echo("")
+        for line in context.transport.diagnose_endpoint_auth(f"{settings.base_url}/_vti_bin/Webs.asmx"):
+            echo(line)
+        echo("")
         if auth and auth.suggested_mode and auth.suggested_mode != settings.auth_mode:
             echo(f"Try SP_AUTH_MODE={auth.suggested_mode} — that is what this server offers.")
         elif settings.auth_mode == "ntlm" and "\\" not in settings.username:

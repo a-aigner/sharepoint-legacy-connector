@@ -75,7 +75,10 @@ def test_probe_narrates_every_step_in_order(env_file: Path, farm: FakeFarm) -> N
     assert positions == sorted(positions)
     assert "[1/8]" in result.stdout and "[8/8]" in result.stdout
     assert result.stdout.count(" OK    ") >= 8
-    assert "login successful" in result.stdout
+    # This env file runs SP_AUTH_MODE=anonymous. Reporting "login successful"
+    # there was a false green: no credential was configured, so none was proven.
+    assert "anonymous — no credential configured" in result.stdout
+    assert "login successful" not in result.stdout
 
 
 def test_probe_reports_request_count_and_bytes(env_file: Path, farm: FakeFarm) -> None:

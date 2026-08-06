@@ -95,6 +95,42 @@ Step 2 tells you what the server actually wants:
 | Redirect to `login.aspx` | Forms auth — **not supported** |
 | Nothing, HTTP 200 | `anonymous` |
 
+**Read the failure block before changing anything.** A 401 has several causes
+that look identical from one request, and the block says which one this is:
+
+```
+  credential  : sent (ntlm) over 3 round trip(s)
+  server says : no WWW-Authenticate challenge on the rejection — the login was
+                likely ACCEPTED and then denied access …
+```
+
+| Line says | Meaning | Where to look |
+|---|---|---|
+| `credential : NONE SENT` | No `Authorization` header ever left the process | `SP_AUTH_MODE` — the handler never ran |
+| `server says : … re-challenges with …` | The credential was **refused** | `SP_USERNAME` / `SP_PASSWORD` |
+| `server says : no WWW-Authenticate challenge` | Login **accepted**, then access denied | SharePoint **permissions**, not the password |
+| `connection : … 'Connection: close'` | Handshake broken mid-flight | NTLM binding — try `integrated`, or Kerberos |
+
+A `credential : sent … over 1 round trip(s)` for NTLM is itself a finding: NTLM
+needs three, so the handshake never started.
+
+Below that, the probe runs a **differential check** — the same resources fetched
+as bodyless GETs — because a POST failing where a GET succeeds has a completely
+different cause than both failing:
+
+```
+Differential check (the POST failed — do bodyless GETs?):
+  GET https://sp.example.de                       -> HTTP 200
+  GET https://sp.example.de/_vti_bin/Webs.asmx    -> HTTP 401
+  => The account reaches the site but not _vti_bin …
+```
+
+| Root | Endpoint | Cause |
+|---|---|---|
+| ok | ok | Only the POST fails — NTLM over a request with a body, not the account |
+| ok | 401 | `_vti_bin` restricted, or no Read on the root web |
+| 401 | 401 | The account cannot read this web at all — a permissions job |
+
 Then check, in order:
 
 1. **Double backslash.** `CONTOSO\\svc` in `.env` is read literally, with two

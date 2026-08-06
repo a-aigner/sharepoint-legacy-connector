@@ -26,6 +26,47 @@ curl -sI http://sharepoint.intern.example.de/
 
 If `curl` also fails, it is not the connector.
 
+### `BaseUrlRedirectError` / `SoapRedirectError` (exit code 2)
+
+`SP_BASE_URL` is not where the farm answers. The message names the value to
+set; set it and re-run.
+
+```
+SP_BASE_URL http://crm.example.de answered HTTP 302 -> https://crm.example.de/Webs.asmx
+  The server redirects http to https. Set SP_BASE_URL to https://crm.example.de …
+```
+
+The usual cause is a base URL on `http` while IIS redirects to `https`, or an
+Alternate Access Mapping pointing at a different host.
+
+**Why the connector refuses to just follow the redirect.** `requests` answers a
+301/302/303 by rewriting `POST` to `GET` and discarding the body, so a
+redirected SOAP call arrives at `*.asmx` as a bodyless GET and IIS returns the
+service-description page with HTTP 200 — which is not SOAP, and reports as
+[`no <…Result> element in response`](#no-getallsubwebcollectionresult-element-in-response)
+several layers away from the actual problem. Following it would also make the
+URLs recorded in the manifest, the web list and the state file disagree with
+the zone the data came from.
+
+**This one is easy to misread**, because GET-based checks keep working: the
+version probe follows the redirect harmlessly and reports the build number, so
+steps 1–4 pass and the farm looks reachable right up until the first real
+operation. If `spconnect probe` prints a server version and then fails, suspect
+the base URL before suspecting permissions.
+
+Confirm it from the shell — a `Location:` header on a `_vti_bin` POST is proof:
+
+```bash
+curl -sS -o /dev/null -D - -X POST http://crm.example.de/_vti_bin/Webs.asmx \
+  -H 'Content-Type: text/xml; charset=utf-8' \
+  -H 'SOAPAction: "http://schemas.microsoft.com/sharepoint/soap/GetAllSubWebCollection"'
+```
+
+Note that some farms rewrite the *path* while redirecting
+(`/_vti_bin/Webs.asmx` → `/Webs.asmx`). That target is not a URL to copy; the
+connector's advice keeps your existing path and changes only the scheme and
+host, which is what `SP_BASE_URL` wants.
+
 ### `FAILED: SSLError`
 
 Only happens over **https**. Old IIS offers TLS 1.0 with ciphers modern OpenSSL

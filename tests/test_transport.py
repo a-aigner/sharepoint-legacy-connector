@@ -12,14 +12,18 @@ import responses
 from conftest import WEB1, fixture_bytes, make_settings
 from spconnect.transport import (
     AuthenticationError,
+    BaseUrlRedirectError,
     NotFoundError,
     RateLimiter,
     RetryableTransportError,
     ServerVersion,
+    SoapRedirectError,
     Transport,
     _looks_like_soap_fault,
+    redirect_target,
 )
 
+ASMX_PATH = "/sites/service/_vti_bin/Lists.asmx"
 ENDPOINT = f"{WEB1}/_vti_bin/Lists.asmx"
 
 
@@ -331,3 +335,121 @@ def test_sharepoint_2010_supports_everything_the_crawler_needs() -> None:
     assert version.product == "SharePoint 2010"
     assert version.supports_change_tokens is True
     assert version.supports_all_sub_web_collection is True
+
+
+# --------------------------------------------------------------------------- #
+# redirects
+#
+# A SharePoint 2010 farm addressed over http while IIS redirected to https
+# produced every failure in this section. The connector reported a missing SOAP
+# result element, then advised SP_AUTH_MODE=anonymous, and named the wrong
+# layer twice before anyone looked at the base URL.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+def test_soap_post_refuses_every_redirect_status(rsps, tp: Transport, status: int) -> None:
+    rsps.add(responses.POST, ENDPOINT, status=status, headers={"Location": f"https://sp{ASMX_PATH}"})
+
+    with pytest.raises(SoapRedirectError) as exc:
+        tp.post_soap(ENDPOINT, b"<x/>", "op")
+
+    assert exc.value.status == status
+    # Following it would rewrite POST to GET and drop the envelope; refusing it
+    # means exactly one request leaves the process, and none is retried.
+    assert len(rsps.calls) == 1
+
+
+def test_soap_redirect_advice_survives_a_farm_that_rewrites_the_path(rsps, tp: Transport) -> None:
+    # The real farm redirected /_vti_bin/Webs.asmx to /Webs.asmx — the target's
+    # path is junk, so the advice must be built from the source path instead.
+    rsps.add(responses.POST, ENDPOINT, status=302, headers={"Location": "https://sp/Lists.asmx"})
+
+    with pytest.raises(SoapRedirectError) as exc:
+        tp.post_soap(ENDPOINT, b"<x/>", "op")
+
+    assert exc.value.suggested_base_url == "https://sp/sites/service"
+    assert "Set SP_BASE_URL to https://sp/sites/service" in str(exc.value)
+    assert "_vti_bin" not in str(exc.value).split("\n")[1]  # not in the advice line
+
+
+def test_soap_post_still_returns_a_normal_body(rsps, tp: Transport) -> None:
+    rsps.add(responses.POST, ENDPOINT, status=200, body="<ok/>")
+    assert tp.post_soap(ENDPOINT, b"<x/>", "op") == b"<ok/>"
+
+
+@pytest.mark.parametrize(
+    ("source", "location", "expected"),
+    [
+        # Scheme change on a root-level site: the case that started this.
+        ("http://crm.example.de", "https://crm.example.de/Webs.asmx", "https://crm.example.de"),
+        # Scheme change on a site collection: keep the path, swap the scheme.
+        ("http://sp/sites/service", "https://sp/Webs.asmx", "https://sp/sites/service"),
+        # Host change: an Alternate Access Mapping pointing elsewhere.
+        ("http://sp/sites/service", "http://intranet/x", "http://intranet/sites/service"),
+        # Same origin: the base URL is fine, the path is the server's business.
+        ("http://sp/sites/service", "http://sp/sites/service/default.aspx", None),
+        # Relative Location: same origin by definition.
+        ("http://sp/sites/service", "/sites/service/default.aspx", None),
+    ],
+)
+def test_redirect_target_keeps_the_source_path(source: str, location: str, expected: str | None) -> None:
+    assert redirect_target(source, location) == expected
+
+
+def test_auth_probe_does_not_call_a_redirect_anonymous(rsps, tp: Transport) -> None:
+    """A 302 is under 400, which used to be read as "answered without a challenge"."""
+    rsps.add(responses.GET, WEB1, status=302, headers={"Location": "https://sp/sites/service"})
+
+    probe = tp.probe_auth_schemes()
+
+    assert probe.is_redirect is True
+    assert probe.suggested_mode is None, "a redirect is not an offer of anonymous access"
+    assert "anonymous" not in probe.advice
+    assert "https://sp/sites/service" in probe.advice
+    assert probe.as_dict()["redirect_to"] == "https://sp/sites/service"
+
+
+def test_auth_probe_still_reports_genuine_anonymous_access(rsps, tp: Transport) -> None:
+    rsps.add(responses.GET, WEB1, status=200, body="<html/>")
+
+    probe = tp.probe_auth_schemes()
+
+    assert probe.is_redirect is False
+    assert probe.suggested_mode == "anonymous"
+
+
+def test_check_base_url_rejects_a_redirecting_farm(rsps, tp: Transport) -> None:
+    rsps.add(responses.GET, WEB1, status=302, headers={"Location": "https://sp/sites/service"})
+
+    with pytest.raises(BaseUrlRedirectError) as exc:
+        tp.check_base_url()
+
+    assert exc.value.suggested_base_url == "https://sp/sites/service"
+    assert exc.value.status == 302
+
+
+def test_check_base_url_accepts_a_farm_that_answers(rsps, tp: Transport) -> None:
+    rsps.add(responses.GET, WEB1, status=401, headers={"WWW-Authenticate": "NTLM"})
+    tp.check_base_url()  # must not raise
+
+
+def test_check_base_url_leaves_forms_auth_to_its_own_diagnosis(rsps, tp: Transport) -> None:
+    # Also a redirect, but "point SP_BASE_URL at the login page" helps nobody.
+    rsps.add(
+        responses.GET,
+        WEB1,
+        status=302,
+        headers={"Location": "http://sp/_layouts/login.aspx?ReturnUrl=%2f"},
+    )
+
+    tp.check_base_url()  # must not raise
+
+    probe = tp.probe_auth_schemes()
+    assert probe.forms_login_url is not None
+    assert "forms-based auth" in probe.advice
+
+
+def test_check_base_url_ignores_a_same_origin_redirect(rsps, tp: Transport) -> None:
+    rsps.add(responses.GET, WEB1, status=302, headers={"Location": f"{WEB1}/default.aspx"})
+    tp.check_base_url()  # must not raise

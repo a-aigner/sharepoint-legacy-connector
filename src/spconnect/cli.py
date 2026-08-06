@@ -26,7 +26,13 @@ from .services.sitedata import SiteDataService
 from .services.webs import WebsService
 from .soap import SoapResponseError
 from .state import StateStore
-from .transport import AuthenticationError, AuthProbe, IntegratedAuthUnavailable, Transport
+from .transport import (
+    AuthenticationError,
+    AuthProbe,
+    IntegratedAuthUnavailable,
+    RedirectRefused,
+    Transport,
+)
 
 log = get_logger(__name__)
 
@@ -198,8 +204,14 @@ def probe(ctx: typer.Context) -> None:
             if auth.error:
                 raise ConnectionError(auth.error)
             st.detail(f"HTTP {auth.status}")
+            if auth.redirect_to:
+                st.note(f"-> {auth.redirect_to}")
 
         with steps.step("Determine authentication scheme") as st:
+            # Before reporting an answer: a farm that redirects every request
+            # has not answered, and the remaining steps would narrate progress
+            # against a URL the farm does not serve.
+            Transport.raise_for_base_url_redirect(auth)
             st.detail(auth.advice)
             if auth.suggested_mode and auth.suggested_mode != settings.auth_mode:
                 st.note(
@@ -277,6 +289,13 @@ def probe(ctx: typer.Context) -> None:
             echo("NTLM usually wants DOMAIN\\username. Yours has no domain part.")
         if settings.auth_mode in ("ntlm", "basic"):
             echo("Consider SP_AUTH_MODE=integrated — it needs no password at all.")
+        raise typer.Exit(2) from exc
+    except RedirectRefused as exc:
+        # Not a farm problem and not worth a -vv suggestion: there is exactly
+        # one thing to change, and it is already named in the message.
+        steps.done()
+        if exc.suggested_base_url:
+            echo(f"\nSet SP_BASE_URL={exc.suggested_base_url} and run `spconnect probe` again.")
         raise typer.Exit(2) from exc
     except SoapResponseError as exc:
         steps.done()

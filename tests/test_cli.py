@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
+import responses
 from typer.testing import CliRunner
 
 from conftest import CASES, WEB1, FakeFarm
@@ -286,3 +287,49 @@ def test_probe_dumps_an_unusable_response_body_to_disk(
     assert dumped.exists()
     assert b"login.aspx" in dumped.read_bytes()
     assert str(dumped) in result.stdout
+
+
+# --------------------------------------------------------------------------- #
+# base URL redirects
+# --------------------------------------------------------------------------- #
+
+
+def ntlm_env_file(tmp_path: Path) -> Path:
+    """An env file configured the way the farm that prompted this one was."""
+    path = tmp_path / "ntlm.env"
+    path.write_text(
+        f"SP_BASE_URL={WEB1}\n"
+        "SP_AUTH_MODE=ntlm\n"
+        "SP_USERNAME=pkober\n"
+        "SP_PASSWORD=supersecret\n"
+        "SP_ALLOW_LEGACY_TLS=false\n"
+        "SP_REQUESTS_PER_SECOND=10000\n"
+        f"SP_LANDING_DIR={tmp_path / 'landing'}\n"
+        f"SP_STATE_FILE={tmp_path / 'landing' / '_state.json'}\n"
+        "SP_LOG_LEVEL=CRITICAL\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_probe_stops_at_the_auth_step_when_the_base_url_redirects(tmp_path: Path, mocked_responses) -> None:
+    mocked_responses.add(responses.GET, WEB1, status=302, headers={"Location": "https://sp/sites/service"})
+
+    result = run(ntlm_env_file(tmp_path), "probe")
+
+    assert result.exit_code == 2
+    assert "Determine authentication scheme" in result.stdout
+    assert "FAILED" in result.stdout
+    assert "SP_BASE_URL=https://sp/sites/service" in result.stdout
+
+
+def test_probe_does_not_suggest_anonymous_for_a_redirecting_farm(tmp_path: Path, mocked_responses) -> None:
+    """The original misdiagnosis: 302 < 400, so the probe called it anonymous."""
+    mocked_responses.add(responses.GET, WEB1, status=302, headers={"Location": "https://sp/sites/service"})
+
+    result = run(ntlm_env_file(tmp_path), "probe")
+
+    assert "anonymous" not in result.stdout
+    # And it stops rather than narrating four more steps against a dead URL.
+    assert "Enumerate webs" not in result.stdout
+    assert "Read server build number" not in result.stdout

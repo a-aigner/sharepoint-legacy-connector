@@ -17,7 +17,7 @@ import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -169,7 +169,79 @@ class RetryableTransportError(TransportError):
     """Signals the tenacity retry loop that another attempt is worthwhile."""
 
 
-class SoapRedirectError(TransportError):
+def redirect_target(source: str, location: str) -> str | None:
+    """The ``SP_BASE_URL`` a redirect implies, or ``None`` if it implies none.
+
+    Scheme and host come from ``location``; the **path comes from ``source``**.
+    Farms rewrite the path while redirecting — the one that prompted this turns
+    ``/_vti_bin/Webs.asmx`` into ``/Webs.asmx`` — so the target's path says
+    nothing about where the site collection lives. Taking it would move a
+    ``/sites/service`` base URL to the web application root and send the
+    operator somewhere no less wrong than where they started.
+    """
+    src, dst = urlsplit(source), urlsplit(location)
+    if not dst.scheme and not dst.netloc:
+        return None  # relative redirect: same origin, so the base URL is fine
+    scheme = dst.scheme or src.scheme
+    netloc = dst.netloc or src.netloc
+    if (scheme, netloc) == (src.scheme, src.netloc):
+        return None
+    return urlunsplit((scheme, netloc, src.path, "", "")).rstrip("/")
+
+
+def redirect_advice(source: str, location: str) -> str:
+    """One operator-facing explanation of a redirect, shared by every layer.
+
+    Deliberately single-sourced: the transport meets redirects at the auth
+    probe, at SOAP POSTs and at the base-URL check, and three hand-written
+    variants of this paragraph would drift into three different diagnoses of
+    the same fact.
+    """
+    if "login.aspx" in location.lower():
+        return (
+            "The target is a forms-authentication login page, which this connector "
+            "does not support. The farm must offer NTLM, Negotiate or Basic."
+        )
+
+    src, dst = urlsplit(source), urlsplit(location)
+    target = redirect_target(source, location)
+    if target is None:
+        return (
+            "The redirect stays on this origin, so SP_BASE_URL is probably right; "
+            f"the path may not be: {location}"
+        )
+    if dst.scheme and dst.scheme != src.scheme:
+        return (
+            f"The server redirects {src.scheme} to {dst.scheme}. Set SP_BASE_URL to "
+            f"{target} so requests go directly to the scheme the farm actually serves."
+        )
+    return (
+        f"The server redirects to a different host ({dst.netloc}). Set SP_BASE_URL to "
+        f"{target} — most likely the farm's Alternate Access Mapping for this zone."
+    )
+
+
+class RedirectRefused(TransportError):
+    """Base for the redirects this connector refuses to follow.
+
+    Never retried, and never followed. A redirect here is a configuration fact,
+    not a transient one: following it papers over a wrong ``SP_BASE_URL``, and
+    the URLs this connector records — manifest roots, web URLs, state keys —
+    would then disagree with the zone the data actually came from.
+    """
+
+    def __init__(self, summary: str, source: str, status: int, location: str) -> None:
+        super().__init__(f"{summary}\n  {redirect_advice(source, location)}")
+        self.source = source
+        self.status = status
+        self.location = location
+
+    @property
+    def suggested_base_url(self) -> str | None:
+        return redirect_target(self.source, self.location)
+
+
+class SoapRedirectError(RedirectRefused):
     """A SOAP POST was answered with a redirect, which silently destroys it.
 
     ``requests`` follows 301/302/303 by rewriting the method to ``GET`` and
@@ -182,38 +254,37 @@ class SoapRedirectError(TransportError):
     The tell is that GET-based checks keep working while every SOAP call fails:
     the version probe redirects harmlessly, so the farm looks reachable right up
     until the first real operation.
-
-    Never retried. A redirect here is a configuration fact, not a transient one.
     """
 
     def __init__(self, endpoint: str, status: int, location: str) -> None:
+        # Advise on the *web* URL, not the endpoint: SP_BASE_URL names a site,
+        # and "set SP_BASE_URL to https://host/_vti_bin/Webs.asmx" is nonsense.
+        # We built this endpoint, so splitting it back apart is safe.
         super().__init__(
-            f"{endpoint} answered HTTP {status} -> {location}\n  {self._advice(endpoint, location)}"
+            f"{endpoint} answered HTTP {status} -> {location}",
+            endpoint.split("/_vti_bin/", 1)[0],
+            status,
+            location,
         )
         self.endpoint = endpoint
-        self.status = status
-        self.location = location
 
-    @staticmethod
-    def _advice(endpoint: str, location: str) -> str:
-        src, dst = urlsplit(endpoint), urlsplit(location)
-        if "login.aspx" in location.lower():
-            return (
-                "The target is a forms-authentication login page, which this connector "
-                "does not support. The farm must offer NTLM, Negotiate or Basic."
-            )
-        if dst.scheme and dst.scheme != src.scheme:
-            return (
-                f"The server redirects {src.scheme} to {dst.scheme}. Set SP_BASE_URL to "
-                f"{dst.scheme}://{dst.netloc or src.netloc} so SOAP is posted directly to "
-                "the scheme the farm actually serves."
-            )
-        if dst.netloc and dst.netloc != src.netloc:
-            return (
-                f"The server redirects to a different host ({dst.netloc}). Set SP_BASE_URL to "
-                "that host — most likely the farm's Alternate Access Mapping for this zone."
-            )
-        return "Point SP_BASE_URL at the redirect target so SOAP is posted there directly."
+
+class BaseUrlRedirectError(RedirectRefused):
+    """``SP_BASE_URL`` is not where this farm answers.
+
+    Raised from the auth probe, before any credential is sent, because every
+    later diagnosis is worthless until this is settled: a farm that redirects
+    every request cannot be asked which authentication schemes it offers.
+    """
+
+    def __init__(self, base_url: str, status: int, location: str) -> None:
+        super().__init__(
+            f"SP_BASE_URL {base_url} answered HTTP {status} -> {location}",
+            base_url,
+            status,
+            location,
+        )
+        self.base_url = base_url
 
 
 @dataclass(frozen=True)
@@ -276,6 +347,22 @@ class AuthProbe:
     schemes: list[str]
     forms_login_url: str | None = None
     error: str | None = None
+    #: ``Location`` of a 3xx. Set even for the forms-login case, which is a
+    #: redirect that happens to be diagnosable further.
+    redirect_to: str | None = None
+    #: The URL that was probed, needed to say where a redirect leads *from*.
+    probed_url: str | None = None
+
+    @property
+    def is_redirect(self) -> bool:
+        """True when the server moved us rather than answering.
+
+        A 3xx is *not* an answer to "which authentication schemes do you
+        offer?". Treating it as one — a 302 is, after all, under 400 — is how
+        this probe used to report a farm that merely redirects http to https as
+        offering anonymous access.
+        """
+        return self.status is not None and self.status in REDIRECT_STATUS
 
     @property
     def suggested_mode(self) -> str | None:
@@ -287,6 +374,8 @@ class AuthProbe:
             return "basic"
         if self.forms_login_url:
             return None  # forms-based auth is out of scope
+        if self.is_redirect:
+            return None  # unknowable until SP_BASE_URL points at the real endpoint
         if self.status is not None and self.status < 400:
             return "anonymous"
         return None
@@ -300,7 +389,13 @@ class AuthProbe:
                 f"forms-based auth (redirects to {self.forms_login_url}). "
                 "NOT SUPPORTED by this connector — that is a follow-up."
             )
+        if self.is_redirect and self.redirect_to:
+            return f"server redirects to {self.redirect_to} instead of answering. " + redirect_advice(
+                self.probed_url or "", self.redirect_to
+            )
         if not self.schemes:
+            if self.is_redirect:
+                return f"server answered HTTP {self.status} with no Location header"
             if self.status is not None and self.status < 400:
                 return "server answered without a challenge; SP_AUTH_MODE=anonymous may work"
             return "server sent no WWW-Authenticate header"
@@ -317,6 +412,7 @@ class AuthProbe:
             "schemes": self.schemes,
             "forms_login_url": self.forms_login_url,
             "suggested_mode": self.suggested_mode,
+            "redirect_to": self.redirect_to,
             "error": self.error,
         }
 
@@ -615,9 +711,44 @@ class Transport:
         elif response.status_code == 200 and b"login.aspx" in response.content[:8192].lower():
             forms_login = target
 
-        probe = AuthProbe(status=response.status_code, schemes=schemes, forms_login_url=forms_login)
-        log.info("auth_probe", status=probe.status, schemes=schemes, suggested=probe.suggested_mode)
+        probe = AuthProbe(
+            status=response.status_code,
+            schemes=schemes,
+            forms_login_url=forms_login,
+            redirect_to=location or None,
+            probed_url=target,
+        )
+        log.info(
+            "auth_probe",
+            status=probe.status,
+            schemes=schemes,
+            suggested=probe.suggested_mode,
+            redirect_to=probe.redirect_to,
+        )
         return probe
+
+    def check_base_url(self, url: str | None = None) -> None:
+        """Fail loudly when ``SP_BASE_URL`` is not where the farm answers.
+
+        Reuses the auth probe's response rather than spending another request:
+        the same unauthenticated, unredirected GET answers both questions, and
+        the auth answer is meaningless while the redirect stands.
+        """
+        probe = self.probe_auth_schemes(url)
+        self.raise_for_base_url_redirect(probe)
+
+    @staticmethod
+    def raise_for_base_url_redirect(probe: AuthProbe) -> None:
+        """Turn a redirecting :class:`AuthProbe` into :class:`BaseUrlRedirectError`.
+
+        Forms-based auth is left alone: that is a redirect too, but it needs its
+        own diagnosis, and pointing ``SP_BASE_URL`` at a login page helps nobody.
+        """
+        if not probe.is_redirect or probe.forms_login_url or not probe.redirect_to:
+            return
+        if redirect_target(probe.probed_url or "", probe.redirect_to) is None:
+            return  # same-origin redirect; the base URL itself is fine
+        raise BaseUrlRedirectError(probe.probed_url or "", probe.status or 0, probe.redirect_to)
 
     # ---- version probe ----
 

@@ -11,6 +11,7 @@ from typer.testing import CliRunner
 
 from conftest import CASES, WEB1, FakeFarm
 from spconnect.cli import app
+from spconnect.transport import AuthenticationError
 
 runner = CliRunner()
 
@@ -395,3 +396,27 @@ def test_permissions_json_is_machine_readable(env_file: Path, farm: FakeFarm) ->
     assert payload["complete"] is True
     assert payload["declared"]["roles"] == ["Lesen"]
     assert all("lists" in web for web in payload["webs"])
+
+
+def test_permissions_stops_when_the_base_url_redirects(tmp_path: Path, mocked_responses) -> None:
+    """Same clean exit as probe: one request, and the value to set."""
+    mocked_responses.add(responses.GET, WEB1, status=302, headers={"Location": "https://sp/sites/service"})
+
+    result = run(ntlm_env_file(tmp_path), "permissions")
+
+    assert result.exit_code == 2
+    assert "SP_BASE_URL=https://sp/sites/service" in result.stdout
+    # And it stops before spending an authenticated request on a dead URL.
+    assert "Enumerate webs" not in result.stdout
+
+
+def test_permissions_emits_the_same_auth_evidence_as_probe(env_file: Path, farm: FakeFarm) -> None:
+    """The differential used to exist only in probe; the evidence is the same evidence."""
+    farm.fail_on["GetAllSubWebCollection"] = AuthenticationError("HTTP 401 for Webs.asmx")
+
+    result = run(env_file, "permissions")
+
+    assert result.exit_code == 2
+    assert "AUTH FAILED" in result.stdout
+    assert "Differential check" in result.stdout
+    assert "Permissions cannot be assessed until the login works." in result.stdout

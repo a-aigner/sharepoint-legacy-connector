@@ -208,6 +208,48 @@ def _domain_notes(context: Context, settings: Settings, auth: AuthProbe | None) 
     return notes
 
 
+def report_auth_failure(context: Context, settings: Settings, auth: AuthProbe | None, exc: Exception) -> None:
+    """Everything we can establish about a 401, gathered here and now.
+
+    Shared by every command that can hit one, because the evidence is the same
+    evidence and there may be exactly one chance to collect it — a customer site
+    visit is not the place to discover that only ``probe`` explains itself.
+    """
+    echo(f"\nAUTH FAILED: {exc}")
+    echo("")
+
+    if auth is None or auth.suggested_mode in (None, settings.auth_mode):
+        for line in context.transport.diagnose_endpoint_auth(f"{settings.base_url}/_vti_bin/Webs.asmx"):
+            echo(line)
+    else:
+        # Every request would 401 for the same trivial reason, and the
+        # differential would read that as "no permissions anywhere". A
+        # confident wrong answer is worse than no answer.
+        echo(
+            f"Skipping the differential check: SP_AUTH_MODE={settings.auth_mode} is not what "
+            "this server offers, so every request fails the same way whatever the account "
+            "can read. Fix the auth mode first, then re-run."
+        )
+
+    echo("")
+    for line in _domain_notes(context, settings, auth):
+        echo(line)
+    echo("")
+
+    if auth and auth.suggested_mode and auth.suggested_mode != settings.auth_mode:
+        echo(f"Try SP_AUTH_MODE={auth.suggested_mode} — that is what this server offers.")
+    elif settings.auth_mode == "ntlm" and "\\" not in settings.username:
+        echo("NTLM usually wants DOMAIN\\username. Yours has no domain part.")
+    if settings.auth_mode in ("ntlm", "basic"):
+        echo("Consider SP_AUTH_MODE=integrated — it needs no password at all.")
+
+
+def report_refused_redirect(exc: RedirectRefused) -> None:
+    """One line, because there is exactly one thing to change and it is named."""
+    if exc.suggested_base_url:
+        echo(f"\nSet SP_BASE_URL={exc.suggested_base_url} and run `spconnect probe` again.")
+
+
 @app.command()
 def probe(ctx: typer.Context) -> None:
     """Auth check, server version, and one trivial call, narrated step by step.
@@ -336,40 +378,13 @@ def probe(ctx: typer.Context) -> None:
         raise typer.Exit(2) from exc
     except AuthenticationError as exc:
         steps.done()
-        echo(f"\nAUTH FAILED: {exc}")
-        # Gather the follow-up evidence here rather than asking the operator to
-        # reproduce it by hand. On a customer site there may be exactly one
-        # chance to run this.
-        echo("")
-        if auth is None or auth.suggested_mode in (None, settings.auth_mode):
-            for line in context.transport.diagnose_endpoint_auth(f"{settings.base_url}/_vti_bin/Webs.asmx"):
-                echo(line)
-        else:
-            # Every request would 401 for the same trivial reason, and the
-            # differential would read that as "no permissions anywhere". A
-            # confident wrong answer is worse than no answer.
-            echo(
-                f"Skipping the differential check: SP_AUTH_MODE={settings.auth_mode} is not what "
-                "this server offers, so every request fails the same way whatever the account "
-                "can read. Fix the auth mode first, then re-run."
-            )
-        echo("")
-        for line in _domain_notes(context, settings, auth):
-            echo(line)
-        echo("")
-        if auth and auth.suggested_mode and auth.suggested_mode != settings.auth_mode:
-            echo(f"Try SP_AUTH_MODE={auth.suggested_mode} — that is what this server offers.")
-        elif settings.auth_mode == "ntlm" and "\\" not in settings.username:
-            echo("NTLM usually wants DOMAIN\\username. Yours has no domain part.")
-        if settings.auth_mode in ("ntlm", "basic"):
-            echo("Consider SP_AUTH_MODE=integrated — it needs no password at all.")
+        report_auth_failure(context, settings, auth, exc)
         raise typer.Exit(2) from exc
     except RedirectRefused as exc:
         # Not a farm problem and not worth a -vv suggestion: there is exactly
         # one thing to change, and it is already named in the message.
         steps.done()
-        if exc.suggested_base_url:
-            echo(f"\nSet SP_BASE_URL={exc.suggested_base_url} and run `spconnect probe` again.")
+        report_refused_redirect(exc)
         raise typer.Exit(2) from exc
     except SoapResponseError as exc:
         steps.done()
@@ -424,12 +439,26 @@ def permissions(
     """
     context = _ctx(ctx)
     settings = context.settings
-    steps = StepReporter(enabled=settings.show_steps and not as_json, total=3)
+    steps = StepReporter(enabled=settings.show_steps and not as_json, total=4)
     steps.heading(f"spconnect permissions -> {settings.base_url}")
     steps.info(f"identity    : {settings.username or 'the current process identity'}")
     echo("")
 
+    auth: AuthProbe | None = None
+
     try:
+        with steps.step("Check the base URL") as st:
+            # One unauthenticated request, before anything that needs a login.
+            # A farm that redirects every request cannot be asked about
+            # permissions, and finding that out from a mangled SOAP call three
+            # steps later names the wrong layer. It also gives the auth-failure
+            # report below the scheme information it needs to be useful.
+            auth = context.transport.probe_auth_schemes()
+            if auth.error:
+                raise ConnectionError(auth.error)
+            Transport.raise_for_base_url_redirect(auth)
+            st.detail(f"HTTP {auth.status} — {auth.advice}")
+
         with steps.step("Enumerate webs") as st:
             version = context.transport.probe_version()
             discovery = WebsService(context.transport, settings.base_url).discover_all_webs(
@@ -455,16 +484,19 @@ def permissions(
             st.detail(f"{report.readable_lists}/{report.total_lists} lists readable")
     except AuthenticationError as exc:
         steps.done()
-        echo(f"\nAUTH FAILED: {exc}")
+        report_auth_failure(context, settings, auth, exc)
         echo("\nPermissions cannot be assessed until the login works.")
+        raise typer.Exit(2) from exc
+    except RedirectRefused as exc:
+        steps.done()
+        report_refused_redirect(exc)
         raise typer.Exit(2) from exc
     except Exception as exc:
         steps.done()
         echo(f"\nFAILED: {type(exc).__name__}: {exc}")
         raise typer.Exit(1) from exc
     finally:
-        if not as_json:
-            context.close()
+        context.close()
 
     if as_json:
         echo(
@@ -490,7 +522,6 @@ def permissions(
                 }
             )
         )
-        context.close()
         return
 
     steps.done()

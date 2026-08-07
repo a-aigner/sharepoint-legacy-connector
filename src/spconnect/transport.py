@@ -525,10 +525,25 @@ def redirect_advice(source: str, location: str) -> str:
             f"the path may not be: {location}"
         )
     if dst.scheme and dst.scheme != src.scheme:
-        return (
+        advice = (
             f"The server redirects {src.scheme} to {dst.scheme}. Set SP_BASE_URL to "
             f"{target} so requests go directly to the scheme the farm actually serves."
         )
+        if (src.scheme, dst.scheme) == ("http", "https"):
+            # Reaching for http to dodge a certificate problem is a reasonable
+            # instinct and a dead end worth naming, because the certificate is not
+            # doing what it looks like it is doing.
+            advice += (
+                "\n  Asking for http will not get you past the certificate: this farm "
+                "does not serve it at this URL. Nor does it need to be got past for "
+                "its own sake — with SP_VERIFY_SSL=false the certificate is never "
+                "validated and cannot cause a 401 by itself. What it *can* do is feed "
+                "the NTLM channel binding, which the server rejects when the "
+                "certificate we see is not the one it expects. Rule that out with "
+                "SP_NTLM_SEND_CBT=false over https, which is the same test http would "
+                "have been and one this farm will actually answer."
+            )
+        return advice
     return (
         f"The server redirects to a different host ({dst.netloc}). Set SP_BASE_URL to "
         f"{target} — most likely the farm's Alternate Access Mapping for this zone."

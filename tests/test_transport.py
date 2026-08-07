@@ -560,6 +560,41 @@ def test_check_base_url_rejects_a_redirecting_farm(rsps, tp: Transport) -> None:
     assert exc.value.status == 302
 
 
+def test_an_http_to_https_redirect_names_the_certificate_dead_end(rsps, tp: Transport) -> None:
+    """Reaching for http to dodge a certificate problem is a reasonable dead end.
+
+    It is worth naming because the certificate is not doing what it looks like it is
+    doing: with SP_VERIFY_SSL=false it is never validated and cannot cause a 401 by
+    itself. What it *can* do is feed the NTLM channel binding — and that is testable
+    over https, which is the only scheme this farm will answer.
+    """
+    rsps.add(responses.GET, WEB1, status=302, headers={"Location": "https://sp/sites/service"})
+
+    with pytest.raises(BaseUrlRedirectError) as exc:
+        tp.check_base_url()
+
+    message = str(exc.value)
+    assert "will not get you past the certificate" in message
+    assert "never validated and cannot cause a 401 by itself" in message
+    assert "SP_NTLM_SEND_CBT=false" in message
+
+
+def test_an_https_to_http_redirect_gets_no_certificate_note(rsps, tp: Transport) -> None:
+    """The advice is specific to the direction that prompted it."""
+    tp.settings.base_url = "https://sp/sites/service"
+    rsps.add(
+        responses.GET,
+        "https://sp/sites/service",
+        status=302,
+        headers={"Location": "http://other/sites/service"},
+    )
+
+    with pytest.raises(BaseUrlRedirectError) as exc:
+        tp.check_base_url()
+
+    assert "certificate" not in str(exc.value)
+
+
 def test_check_base_url_accepts_a_farm_that_answers(rsps, tp: Transport) -> None:
     rsps.add(responses.GET, WEB1, status=401, headers={"WWW-Authenticate": "NTLM"})
     tp.check_base_url()  # must not raise

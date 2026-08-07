@@ -681,6 +681,86 @@ def test_the_differential_does_not_count_a_denial_redirect_as_reaching_the_site(
     assert "cannot read this web at all" in lines
 
 
+def test_the_differential_refuses_to_read_anonymous_200s_as_a_working_credential(
+    rsps, tmp_path: Path
+) -> None:
+    """Two GETs served without a credential prove nothing about the credential.
+
+    This is the false green that sent a real site visit after Kerberos. The farm
+    allows anonymous reads, so both bodyless GETs answer 200 having asked for
+    nothing — and the check called that "the credential is accepted for both"
+    and blamed the POST's body for a refusal that was really the account.
+    """
+    tp = Transport(make_settings(tmp_path, auth_mode="ntlm", username="CONTOSO\\p", password="pw"))
+    tp.session.auth = None  # nothing attaches a credential: every 200 is anonymous
+    rsps.add(responses.GET, WEB1, status=200)
+    rsps.add(responses.GET, ENDPOINT, status=200)
+
+    lines = "\n".join(tp.diagnose_endpoint_auth(ENDPOINT))
+
+    assert "anonymous" in lines, "the 200s must be marked as having sent no credential"
+    assert "INCONCLUSIVE" in lines
+    assert "SP_USERNAME / SP_PASSWORD" in lines
+    assert "The credential is accepted for both" not in lines
+    # It may *name* Kerberos to rule it out; it must not send anyone after it.
+    assert "Ask for Kerberos/Negotiate" not in lines
+
+
+def test_the_differential_still_blames_the_post_when_the_gets_did_authenticate(rsps, tmp_path: Path) -> None:
+    """The original verdict, kept for the farm it was written for.
+
+    Here the GETs really do exercise the credential and really are accepted, so
+    the POST being the only failure does point at the handshake over a body.
+    """
+    tp = Transport(make_settings(tmp_path, auth_mode="ntlm", username="CONTOSO\\p", password="pw"))
+    tp.session.auth = CompletedHandshake()
+    rsps.add(responses.GET, WEB1, status=200)
+    rsps.add(responses.GET, ENDPOINT, status=200)
+
+    lines = "\n".join(tp.diagnose_endpoint_auth(ENDPOINT))
+
+    assert "The credential is accepted for both" in lines
+    assert "Kerberos" in lines
+    assert "anonymous" not in lines
+
+
+def test_a_refused_get_does_not_count_as_proof_the_credential_works(rsps, tmp_path: Path) -> None:
+    """A 401 that carried a credential must not be recorded as an acceptance.
+
+    `credential_accepted` is what priming and the differential both lean on, so
+    letting a *rejection* set it would turn every later anonymous 200 into a
+    forged authenticated connection.
+    """
+    tp = Transport(make_settings(tmp_path, auth_mode="ntlm", username="CONTOSO\\p", password="pw"))
+    tp.session.auth = CompletedHandshake()
+    rsps.add(responses.GET, WEB1, status=401)
+    rsps.add(responses.GET, ENDPOINT, status=401)
+
+    tp.diagnose_endpoint_auth(ENDPOINT)
+
+    assert tp.credential_accepted is False
+
+
+def test_channel_bindings_can_be_switched_off(tmp_path: Path) -> None:
+    """An escape hatch for TLS that is terminated somewhere other than the farm.
+
+    The client binds its Type 3 to the certificate *it* sees. Behind an
+    SSL-offloading proxy that is not the certificate the server expects, and the
+    Type 3 is refused with a bare re-challenge — indistinguishable from a wrong
+    password without turning this off and comparing.
+    """
+    on = Transport(make_settings(tmp_path, auth_mode="ntlm", username="u", password="p"))
+    off = Transport(
+        make_settings(tmp_path, auth_mode="ntlm", username="u", password="p", ntlm_send_cbt=False)
+    )
+    try:
+        assert on.session.auth.send_cbt is True, "on by default: EPA-enforcing farms need it"
+        assert off.session.auth.send_cbt is False
+    finally:
+        on.close()
+        off.close()
+
+
 # --------------------------------------------------------------------------- #
 # NTLM connection priming
 #

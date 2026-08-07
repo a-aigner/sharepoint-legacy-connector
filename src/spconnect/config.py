@@ -120,6 +120,15 @@ class Settings(BaseSettings):
     #: the handshake for POSTs while leaving GETs working. Priming the connection
     #: with a GET first gets the handshake done where it can succeed.
     ntlm_prime_connection: bool = True
+    #: Bind the NTLM Type 3 to the server's TLS certificate (a Channel Binding
+    #: Token). On by default because IIS with Extended Protection set to
+    #: *Required* refuses a Type 3 that lacks one. Turn it **off** when TLS is
+    #: terminated somewhere other than the farm — a load balancer, a reverse
+    #: proxy — because the client binds to the certificate *it* sees, which is
+    #: then not the one the server expects, and the Type 3 is refused with a bare
+    #: re-challenge that looks exactly like a wrong password. https only; there
+    #: is no channel to bind over http.
+    ntlm_send_cbt: bool = True
     timeout_seconds: float = 120.0
     max_retries: int = 5
     backoff_base_seconds: float = 2.0

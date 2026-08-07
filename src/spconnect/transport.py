@@ -405,6 +405,28 @@ def describe_auth_failure(response: requests.Response, *, auth_mode: str, userna
     return "\n".join(lines)
 
 
+@dataclass(frozen=True)
+class EndpointCheck:
+    """One bodyless GET, and whether it proves anything about the credential.
+
+    ``reached`` and ``authenticated`` are different questions, and conflating
+    them is how the differential check came to blame a SOAP POST's body on a farm
+    that had never authenticated anybody. Where anonymous access is enabled a 200
+    is served without anyone being asked for anything, so it says nothing
+    whatsoever about the account.
+    """
+
+    description: str
+    reached: bool
+    #: Did this exchange put a credential on the wire *and* have it accepted?
+    authenticated: bool = False
+
+    def __str__(self) -> str:
+        if self.reached and not self.authenticated:
+            return f"{self.description} (anonymous — no credential was sent)"
+        return self.description
+
+
 class NotFoundError(TransportError):
     """404. Never retried."""
 
@@ -831,7 +853,18 @@ class Transport:
         elif settings.auth_mode == "ntlm":
             from requests_ntlm import HttpNtlmAuth
 
-            session.auth = HttpNtlmAuth(settings.username, settings.password.get_secret_value())
+            if not settings.ntlm_send_cbt:
+                log.warning(
+                    "auth.ntlm_cbt_disabled",
+                    detail="SP_NTLM_SEND_CBT=false — the Type 3 is not bound to the server's "
+                    "certificate. Correct where TLS is terminated by a proxy; a farm with "
+                    "Extended Protection set to Required will refuse an unbound Type 3.",
+                )
+            session.auth = HttpNtlmAuth(
+                settings.username,
+                settings.password.get_secret_value(),
+                send_cbt=settings.ntlm_send_cbt,
+            )
         elif settings.auth_mode == "basic":
             log.warning(
                 "auth.basic",
@@ -1244,8 +1277,8 @@ class Transport:
             log.info("ntlm_domain", **found.as_dict())
         return found
 
-    def _status_of(self, method: str, url: str) -> tuple[str, bool]:
-        """``(description, reached_it)`` for one authenticated request. Never raises.
+    def _status_of(self, method: str, url: str) -> EndpointCheck:
+        """One authenticated request, as evidence. Never raises.
 
         Bypasses :meth:`_send` deliberately: there a 401 is an exception, and
         here it is the measurement. Redirects are not followed, so a redirect to
@@ -1259,58 +1292,99 @@ class Transport:
                 method, url, timeout=self.settings.timeout_seconds, allow_redirects=False
             )
         except (requests.ConnectionError, requests.Timeout) as exc:
-            return type(exc).__name__, False
+            return EndpointCheck(type(exc).__name__, reached=False)
+
+        # Short-circuit rather than call :meth:`_authenticated` outright: that
+        # records an *acceptance*, and a 401 here may well have carried a
+        # credential and had it refused. Recording that would forge proof the
+        # account works and hand it to every later anonymous 200.
+        authenticated = response.status_code not in (401, 403) and self._authenticated(response)
 
         location = response.headers.get("Location", "")
         if denied := denial_page(location):
-            return f"{response.status_code} -> {denied}", False
+            return EndpointCheck(f"{response.status_code} -> {denied}", False, authenticated)
+        reached = response.status_code < 400
         if location:
-            return f"{response.status_code} -> {location}", response.status_code < 400
-        return str(response.status_code), response.status_code < 400
+            return EndpointCheck(f"{response.status_code} -> {location}", reached, authenticated)
+        return EndpointCheck(str(response.status_code), reached, authenticated)
 
     def diagnose_endpoint_auth(self, endpoint: str) -> list[str]:
         """Separate "this credential is refused" from "this *request* is refused".
 
-        A 401 on a SOAP POST has three very different causes that look identical
+        A 401 on a SOAP POST has four very different causes that look identical
         from one request. Two extra bodyless GETs tell them apart:
 
-        =================  ================  ==============================================
-        GET site root      GET the endpoint  Reading
-        =================  ================  ==============================================
-        ok                 ok                The credential is fine here — the **POST**
-                                             is what fails. NTLM authenticates a
-                                             connection, and IIS often closes it when it
-                                             401s a request carrying a body, which fails
-                                             the handshake regardless of the password.
-        ok                 401               The account reaches the site but not
-                                             ``_vti_bin`` — permissions on the web
-                                             services, or a different auth provider
-                                             configured on that virtual directory.
-        401                401               The account cannot read this web at all.
-                                             A SharePoint permissions job, not a
-                                             connector one.
-        =================  ================  ==============================================
+        ==============  ==============  ==============  ============================
+        GET site root   GET endpoint    Credential      Reading
+                                        exercised?
+        ==============  ==============  ==============  ============================
+        ok              ok              yes             The credential is fine here
+                                                        — the **POST** is what
+                                                        fails. NTLM authenticates a
+                                                        connection, and IIS often
+                                                        closes it when it 401s a
+                                                        request carrying a body,
+                                                        which fails the handshake
+                                                        regardless of the password.
+        ok              ok              **no**          Anonymous access. Neither
+                                                        GET tested anything, so the
+                                                        POST is simply the first
+                                                        request that needed a
+                                                        credential — and it was
+                                                        refused. The account, not
+                                                        the request.
+        ok              401             —               The account reaches the site
+                                                        but not ``_vti_bin`` —
+                                                        permissions on the web
+                                                        services, or a different
+                                                        auth provider on that
+                                                        virtual directory.
+        401             401             —               The account cannot read this
+                                                        web at all. A SharePoint
+                                                        permissions job, not a
+                                                        connector one.
+        ==============  ==============  ==============  ============================
+
+        That second row is the one this check used to get wrong, and it is not a
+        rare farm: it reported "the credential is accepted for both" off two 200s
+        that had never been asked for a credential, and sent a real site visit
+        after Kerberos for a refusal that was the password.
 
         Read-only, three requests, and it runs where the failure happened rather
         than asking the operator to reproduce it by hand.
         """
         root = self.settings.base_url
-        root_get, root_ok = self._status_of("GET", root)
-        endpoint_get, endpoint_ok = self._status_of("GET", endpoint)
+        root_check = self._status_of("GET", root)
+        endpoint_check = self._status_of("GET", endpoint)
 
         lines = [
             "Differential check (the POST failed — do bodyless GETs?):",
-            f"  GET {root} -> HTTP {root_get}",
-            f"  GET {endpoint} -> HTTP {endpoint_get}",
+            f"  GET {root} -> HTTP {root_check}",
+            f"  GET {endpoint} -> HTTP {endpoint_check}",
         ]
 
-        if root_ok and endpoint_ok:
+        if root_check.reached and endpoint_check.reached and not self.credential_accepted:
+            # Nothing in this whole session has ever authenticated — not these
+            # GETs, not the version probe. There is no control here at all, and
+            # the POST's body is the one explanation the evidence cannot support.
+            lines.append(
+                "  => INCONCLUSIVE, and not about the POST. Both GETs were served "
+                "anonymously, so neither tested the credential — this farm allows "
+                "anonymous reads and nothing in this run has authenticated at any point. "
+                "The SOAP POST is the only request SharePoint refuses to serve "
+                "anonymously, which makes it the first real test of the account rather "
+                "than a victim of its own body. Read this as the credential being "
+                "refused: SP_USERNAME / SP_PASSWORD, or the account itself. Asking for "
+                "Kerberos on the strength of these two 200s would be asking for the "
+                "wrong thing."
+            )
+        elif root_check.reached and endpoint_check.reached:
             lines.append(
                 "  => The credential is accepted for both. Only the POST fails, which "
                 "points at the NTLM handshake over a request with a body rather than at "
                 "the account. Ask for Kerberos/Negotiate, or try SP_AUTH_MODE=integrated."
             )
-        elif root_ok:
+        elif root_check.reached:
             lines.append(
                 "  => The account reaches the site but not _vti_bin. Ask the SharePoint "
                 "admin whether the web services are restricted on this zone, and whether "

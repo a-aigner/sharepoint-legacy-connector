@@ -467,8 +467,65 @@ def probe(ctx: typer.Context) -> None:
 # --------------------------------------------------------------------------- #
 
 
+#: How many collections to try before giving up on finding one that answers. A
+#: service document names every list on the web, and a farm of this vintage should
+#: not be asked to serve fifty probes to settle one question.
+REST_PROBE_ATTEMPTS = 8
+
+
+def _first_readable_collection(
+    service: ODataService, sets: list[str], *, override: str | None
+) -> tuple[str | None, int, list[str]]:
+    """``(collection, rows, skipped)`` — the first one that actually answers.
+
+    Taking ``sets[0]`` on trust was the mistake this replaces. A service document
+    names every list on the web in whatever order the farm feels like, and the
+    first is routinely a system gallery — a style library, a user information list
+    — which answers 404 or an error and settles nothing about whether the farm's
+    *data* is readable. Worse, it made REST look broken on a farm where it was not.
+
+    A collection with rows in it is preferred over one that merely answers, since
+    an empty feed proves rather less. Both beat nothing, so an empty-but-readable
+    one is remembered and used if no candidate has data.
+
+    An explicit ``override`` is tried alone and never checked against the service
+    document: an operator naming a collection knows something discovery may
+    disagree with, and refusing it on discovery's word would defeat the point of
+    being able to name it.
+    """
+    candidates = [override] if override else sets[:REST_PROBE_ATTEMPTS]
+    skipped: list[str] = []
+    empty: str | None = None
+
+    for name in candidates:
+        try:
+            page = service.get_items(name, top=1)
+        except AuthenticationError:
+            raise  # a refused credential is the one thing worth stopping for
+        except Exception as exc:
+            skipped.append(f"{name}: {type(exc).__name__}: {str(exc).splitlines()[0]}")
+            continue
+        if page.rows:
+            return name, len(page.rows), skipped
+        if empty is None:
+            empty = name
+        skipped.append(f"{name}: readable but empty")
+
+    return empty, 0, skipped
+
+
 @app.command("probe-rest")
-def probe_rest(ctx: typer.Context) -> None:
+def probe_rest(
+    ctx: typer.Context,
+    entity_set: Annotated[
+        str | None,
+        typer.Option(
+            "--entity-set",
+            "-e",
+            help="Read this collection instead of picking one that answers, e.g. -e Ticket.",
+        ),
+    ] = None,
+) -> None:
     """The same farm reached over REST instead of SOAP, as a second opinion.
 
     ``ListData.svc`` sits in the **same ``_vti_bin`` directory** as
@@ -542,11 +599,22 @@ def probe_rest(ctx: typer.Context) -> None:
         with steps.step("Read one row over REST") as st:
             if rest != "ok":
                 st.detail("skipped — ListData.svc did not answer")
-            elif not sets:
+            elif not sets and entity_set is None:
                 st.detail("no entity sets exposed")
             else:
-                page = service.get_items(sets[0], top=1)
-                st.detail(f"{sets[0]}: {len(page.rows)} row(s)")
+                chosen, rows, skipped = _first_readable_collection(service, sets, override=entity_set)
+                if chosen is None:
+                    st.ok = False
+                    st.detail("no collection could be read")
+                else:
+                    st.detail(f"{chosen}: {rows} row(s)")
+                for line in skipped:
+                    st.note(f"skipped {line}")
+                if entity_set is None and skipped:
+                    st.note(
+                        "The first name in the service document is often a system gallery. "
+                        "Name one directly with -e <collection> to test a specific list."
+                    )
                 for name in sets[:10]:
                     st.note(f"- {name}")
                 if len(sets) > 10:

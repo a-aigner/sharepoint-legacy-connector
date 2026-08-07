@@ -11,8 +11,9 @@ import responses
 from typer.testing import CliRunner
 
 from conftest import CASES, WEB1, FakeFarm
-from spconnect.cli import app
+from spconnect.cli import REST_PROBE_ATTEMPTS, _first_readable_collection, app
 from spconnect.cli import run as cli_run
+from spconnect.services.odata import ODataPage, ODataUnavailable
 from spconnect.transport import AuthenticationError
 
 runner = CliRunner()
@@ -465,6 +466,124 @@ def test_probe_fails_at_login_when_sharepoint_denies_access(tmp_path: Path, mock
 # --------------------------------------------------------------------------- #
 # probe-rest
 # --------------------------------------------------------------------------- #
+
+
+class _FakeOData:
+    """A ListData.svc whose per-collection behaviour is scripted.
+
+    Values are a row count, or an exception to raise. Enough to drive collection
+    selection without a farm, which is the point: the choice is pure logic and
+    deserves to be tested as such.
+    """
+
+    def __init__(self, behaviour: dict[str, object]) -> None:
+        self.behaviour = behaviour
+        self.asked: list[str] = []
+
+    def get_items(self, name: str, *, top: int = 1) -> ODataPage:
+        self.asked.append(name)
+        outcome = self.behaviour.get(name, 0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return ODataPage(rows=[{"Id": i + 1} for i in range(int(outcome))])  # type: ignore[arg-type]
+
+
+def test_a_system_gallery_first_in_the_document_does_not_decide_the_verdict() -> None:
+    """The bug: `sets[0]` was taken on trust and made REST look broken.
+
+    A service document names every list on the web in whatever order the farm
+    likes, and the first is routinely a gallery that 404s. Stopping there settles
+    nothing about whether the farm's data is readable.
+    """
+    service = _FakeOData({"MasterPageGallery": ODataUnavailable("404"), "Ticket": 1})
+
+    chosen, rows, skipped = _first_readable_collection(
+        service, ["MasterPageGallery", "Ticket"], override=None
+    )
+
+    assert (chosen, rows) == ("Ticket", 1)
+    assert service.asked == ["MasterPageGallery", "Ticket"]
+    assert "MasterPageGallery" in skipped[0]
+
+
+def test_a_collection_with_rows_is_preferred_over_one_that_is_merely_readable() -> None:
+    """An empty feed proves the collection answers; it proves little else."""
+    service = _FakeOData({"Leer": 0, "Ticket": 1})
+
+    chosen, rows, _ = _first_readable_collection(service, ["Leer", "Ticket"], override=None)
+
+    assert (chosen, rows) == ("Ticket", 1)
+
+
+def test_a_readable_but_empty_collection_still_beats_nothing() -> None:
+    service = _FakeOData({"Leer": 0, "Auch leer": 0})
+
+    chosen, rows, skipped = _first_readable_collection(service, ["Leer", "Auch leer"], override=None)
+
+    assert (chosen, rows) == ("Leer", 0)
+    assert any("readable but empty" in line for line in skipped)
+
+
+def test_an_explicitly_named_collection_is_not_checked_against_discovery() -> None:
+    """`-e Ticket` must be tried even when the service document never named it.
+
+    An operator naming a collection knows something discovery may disagree with —
+    on the reported farm, `/Ticket` returns data in a browser. Refusing it on
+    discovery's word would defeat the point of being able to name it.
+    """
+    service = _FakeOData({"Ticket": 1})
+
+    chosen, rows, _ = _first_readable_collection(service, ["Kunden"], override="Ticket")
+
+    assert (chosen, rows) == ("Ticket", 1)
+    assert service.asked == ["Ticket"], "the override is tried alone"
+
+
+def test_nothing_readable_is_reported_as_such() -> None:
+    service = _FakeOData({"a": ODataUnavailable("404"), "b": ODataUnavailable("404")})
+
+    chosen, rows, skipped = _first_readable_collection(service, ["a", "b"], override=None)
+
+    assert chosen is None and rows == 0
+    assert len(skipped) == 2
+
+
+def test_a_refused_credential_stops_the_search_rather_than_being_skipped() -> None:
+    """Trying forty more collections against a refused account is not diagnosis."""
+    service = _FakeOData({"a": AuthenticationError("HTTP 401")})
+
+    with pytest.raises(AuthenticationError):
+        _first_readable_collection(service, ["a", "b"], override=None)
+
+    assert service.asked == ["a"]
+
+
+def test_the_search_is_bounded() -> None:
+    """A service document can name every list on the web; this is a probe."""
+    names = [f"list{i}" for i in range(50)]
+    service = _FakeOData({n: ODataUnavailable("404") for n in names})
+
+    _first_readable_collection(service, names, override=None)
+
+    assert len(service.asked) == REST_PROBE_ATTEMPTS
+
+
+def test_probe_rest_can_be_pointed_at_one_collection(env_file: Path, farm: FakeFarm) -> None:
+    result = run(env_file, "probe-rest", "-e", "Servicefälle")
+
+    assert result.exit_code == 0
+    assert "Servicefälle:" in result.stdout
+    assert "row(s)" in result.stdout
+
+
+def test_probe_rest_names_the_representation_it_was_served(env_file: Path, farm: FakeFarm) -> None:
+    """Which of the two OData formats answered is the whole question on some farms."""
+    farm.odata_format = "atom"
+
+    result = run(env_file, "probe-rest")
+
+    assert result.exit_code == 0
+    assert "served as atom" in result.stdout
 
 
 def test_probe_rest_succeeds_when_both_backends_work(env_file: Path, farm: FakeFarm) -> None:

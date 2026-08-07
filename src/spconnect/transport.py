@@ -1066,8 +1066,9 @@ class Transport:
                 "ntlm_prime.retry",
                 endpoint=endpoint,
                 detail=(
-                    "the POST was refused but a bodyless GET to the same endpoint was not; "
-                    "retrying the POST on the connection that GET authenticated"
+                    "the POST was refused, but a contentless request to the same endpoint "
+                    "negotiated successfully; retrying the POST on the connection that "
+                    "authenticated"
                 ),
             )
             return self.post_soap(endpoint, body, soap_action, _primed=True)

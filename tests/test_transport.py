@@ -835,3 +835,38 @@ def test_a_401_with_no_challenge_to_ntlm_is_a_handshake_that_never_started() -> 
 def test_anonymous_mode_still_gets_the_plain_advice() -> None:
     message = describe_auth_failure(a_401(sent_credential=False), auth_mode="anonymous", username="")
     assert "SP_AUTH_MODE is 'anonymous'" in message
+
+
+def test_the_envelope_survives_every_retry_path(rsps, tmp_path: Path) -> None:
+    """A consumed body would silently send an empty envelope on the retry.
+
+    We pass `bytes`, which is immutable and replayable, and requests-ntlm copies
+    the PreparedRequest per handshake leg rather than streaming it. Worth
+    pinning: switching to a file object or generator here would break the retry
+    without breaking anything that fails loudly.
+    """
+    tp = Transport(make_settings(tmp_path, auth_mode="ntlm", username="u", password="p", max_retries=3))
+    tp.session.auth = CompletedHandshake()
+    envelope = b"<envelope>not to be consumed</envelope>"
+    rsps.add(responses.POST, ENDPOINT, status=503)  # tenacity retry
+    rsps.add(responses.POST, ENDPOINT, status=401)  # priming retry
+    rsps.add(responses.POST, ENDPOINT, status=200)  # the priming call
+    rsps.add(responses.POST, ENDPOINT, status=200, body="<ok/>")
+
+    assert tp.post_soap(ENDPOINT, envelope, "op") == b"<ok/>"
+
+    sent = [c.request.body for c in rsps.calls]
+    assert sent[0] == envelope, "first attempt"
+    assert sent[1] == envelope, "after the tenacity retry"
+    assert not sent[2], "the priming call is contentless by design"
+    assert sent[3] == envelope, "after the priming retry"
+
+
+def test_a_farm_that_always_401s_terminates(rsps, ntlm_tp) -> None:
+    """No loop: the handshake retry is one-shot, whatever the server does."""
+    rsps.add(responses.POST, ENDPOINT, status=401)  # every request, forever
+
+    with pytest.raises(AuthenticationError):
+        ntlm_tp.post_soap(ENDPOINT, b"<x/>", "op")
+
+    assert len(rsps.calls) == 2  # the call, one priming attempt, then done

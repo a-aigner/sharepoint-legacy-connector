@@ -107,10 +107,18 @@ SHAREPOINT_PRODUCTS = {
 #: Providers tried, in order, for ``SP_AUTH_MODE=integrated``. Each is optional
 #: and platform-specific, so they are imported lazily and a clear install hint is
 #: raised if none is present.
+#: ``(module, class, how to get it)``. The third field is prose rather than an
+#: extra name because they do not map one-to-one: ``spconnect[kerberos]``
+#: installs ``requests-gssapi``, and ``requests-kerberos`` is only honoured if
+#: something else already brought it in.
 INTEGRATED_PROVIDERS: tuple[tuple[str, str, str], ...] = (
-    ("requests_negotiate_sspi", "HttpNegotiateAuth", "spconnect[windows]"),
-    ("requests_gssapi", "HTTPSPNEGOAuth", "spconnect[kerberos]"),
-    ("requests_kerberos", "HTTPKerberosAuth", "spconnect[kerberos]"),
+    (
+        "requests_negotiate_sspi",
+        "HttpNegotiateAuth",
+        "Windows only — pip install 'spconnect[windows]'",
+    ),
+    ("requests_gssapi", "HTTPSPNEGOAuth", "Kerberos — pip install 'spconnect[kerberos]'"),
+    ("requests_kerberos", "HTTPKerberosAuth", "Kerberos, older binding — not installed by any extra"),
 )
 
 
@@ -133,7 +141,7 @@ def build_integrated_auth() -> Any:
         try:
             module = importlib.import_module(module_name)
         except ImportError:
-            attempted.append(f"{module_name} (install: pip install '{extra}')")
+            attempted.append(f"{module_name} — {extra}")
             continue
         factory = getattr(module, class_name, None)
         if factory is None:  # pragma: no cover - provider API drift
@@ -145,9 +153,13 @@ def build_integrated_auth() -> Any:
     raise IntegratedAuthUnavailable(
         "SP_AUTH_MODE=integrated needs a platform auth provider, none of which is installed:\n  "
         + "\n  ".join(attempted)
-        + "\nOn a domain-joined Windows box: pip install 'spconnect[windows]', then run the "
-        "crawl as the service account. With a Kerberos ticket: pip install 'spconnect[kerberos]' "
-        "and kinit first."
+        + "\n\nOn domain-joined Windows: pip install 'spconnect[windows]', then run as the"
+        "\nservice account. Elsewhere: pip install 'spconnect[kerberos]' and kinit first."
+        "\n\nBefore installing anything, check what the farm actually offers — step 2 of"
+        "\n`spconnect probe` prints it. The Kerberos provider speaks Negotiate/SPNEGO, so"
+        "\na farm whose challenge is NTLM only cannot use it however it is installed, and"
+        "\nintegrated auth is then unavailable on this platform. Stay on SP_AUTH_MODE=ntlm"
+        "\nthere; it is not the weaker option against such a farm, it is the only one."
     )
 
 
@@ -324,12 +336,15 @@ def describe_auth_failure(response: requests.Response, *, auth_mode: str, userna
         # "Basic" and "ntlm" name both a setting and a wire scheme; when the two
         # disagree the credential was never in the running, and blaming the
         # password sends the operator to reset an account that is fine.
-        wire_scheme = {"ntlm": "ntlm", "basic": "basic", "integrated": "negotiate"}.get(auth_mode)
-        if (
-            wire_scheme
-            and wire_scheme not in offered
-            and not (wire_scheme == "ntlm" and "negotiate" in offered)
-        ):
+        # What each mode can actually put on the wire. `integrated` is not a
+        # scheme of its own: SSPI and SPNEGO negotiate NTLM or Kerberos, so it
+        # counts as unoffered only when the server offers neither.
+        usable = {
+            "ntlm": {"ntlm", "negotiate"},
+            "basic": {"basic"},
+            "integrated": {"ntlm", "negotiate"},
+        }.get(auth_mode, set())
+        if usable and not (usable & offered):
             lines.append(
                 f"  server says : it does not offer {auth_mode} at all — only "
                 f"{', '.join(schemes)}. The credential was never tried."
@@ -574,6 +589,9 @@ class AuthProbe:
     redirect_to: str | None = None
     #: The URL that was probed, needed to say where a redirect leads *from*.
     probed_url: str | None = None
+    #: The configured ``SP_AUTH_MODE``, so advice can avoid suggesting a change
+    #: that is not one.
+    configured_mode: str = ""
 
     @property
     def is_redirect(self) -> bool:
@@ -591,7 +609,11 @@ class AuthProbe:
         """The ``SP_AUTH_MODE`` this server appears to want, or ``None``."""
         lowered = {s.lower() for s in self.schemes}
         if "ntlm" in lowered or "negotiate" in lowered:
-            return "ntlm"
+            # `integrated` covers both of these and stores no password, so it is
+            # never something to be talked out of. Reporting "the server offers
+            # ntlm" to someone already on integrated reads as advice to
+            # downgrade, when the two are the same wire schemes.
+            return "ntlm" if self.configured_mode != "integrated" else "integrated"
         if "basic" in lowered:
             return "basic"
         if self.forms_login_url:
@@ -1018,6 +1040,7 @@ class Transport:
             forms_login_url=forms_login,
             redirect_to=location or None,
             probed_url=target,
+            configured_mode=self.settings.auth_mode,
         )
         log.info(
             "auth_probe",

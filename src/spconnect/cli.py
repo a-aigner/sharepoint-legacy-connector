@@ -62,6 +62,18 @@ class Context:
             self._transport = Transport(self.settings)
         return self._transport
 
+    @property
+    def transport_if_built(self) -> Transport | None:
+        """The transport, or ``None`` — never constructs one.
+
+        For ``finally`` blocks. Building a transport can itself fail (no
+        integrated-auth provider installed, for one), and a summary that
+        constructs what it is summarising turns that failure into a second
+        exception raised from ``finally``, which discards the first along with
+        the handler written to explain it.
+        """
+        return self._transport
+
     def crawler(self) -> Crawler:
         return Crawler(self.settings, self.transport)
 
@@ -84,6 +96,23 @@ def echo(message: str = "") -> None:
 
 def _dump_json(payload: Any) -> str:
     return json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+
+
+def report_traffic(context: Context) -> None:
+    """Print what left the process. Silent when no transport was ever built."""
+    transport = context.transport_if_built
+    if transport is None:
+        return
+    diagnostics = transport.side_channel_requests
+    echo("")
+    echo(
+        f"{transport.request_count + diagnostics} HTTP requests"
+        + (f" ({diagnostics} diagnostic)" if diagnostics else "")
+        + f", {format_bytes(transport.bytes_received)} received"
+    )
+    trace = transport.trace
+    if trace is not None and trace.entries:
+        echo(f"{trace.entries} bodies captured to {trace.path} (mode 0600)")
 
 
 @app.callback(invoke_without_command=True)
@@ -411,16 +440,7 @@ def probe(ctx: typer.Context) -> None:
         echo("\nRe-run with -vv to see the full request and response.")
         raise typer.Exit(1) from exc
     finally:
-        echo("")
-        diagnostics = context.transport.side_channel_requests
-        echo(
-            f"{context.transport.request_count + diagnostics} HTTP requests"
-            + (f" ({diagnostics} diagnostic)" if diagnostics else "")
-            + f", {format_bytes(context.transport.bytes_received)} received"
-        )
-        trace = context.transport.trace
-        if trace is not None and trace.entries:
-            echo(f"{trace.entries} bodies captured to {trace.path} (mode 0600)")
+        report_traffic(context)
         context.close()
 
     steps.done("PROBE OK — the connector can read this farm.")
@@ -544,11 +564,7 @@ def probe_rest(ctx: typer.Context) -> None:
         echo(f"\nFAILED: {type(exc).__name__}: {exc}")
         raise typer.Exit(1) from exc
     finally:
-        echo("")
-        echo(
-            f"{context.transport.request_count + context.transport.side_channel_requests} "
-            f"HTTP requests, {format_bytes(context.transport.bytes_received)} received"
-        )
+        report_traffic(context)
         context.close()
 
     steps.done("REST reachable." if rest == "ok" else f"REST NOT reachable ({rest}).")
@@ -1121,7 +1137,7 @@ def _print_summary(report: RunReport, crawler: Crawler) -> None:
     _print_unique_scope_warning(report)
 
 
-def run() -> None:  # pragma: no cover - console-script shim
+def run() -> None:
     try:
         app()
     except KeyboardInterrupt:
@@ -1130,6 +1146,13 @@ def run() -> None:  # pragma: no cover - console-script shim
             "re-run with `spconnect crawl --resume`."
         )
         sys.exit(130)
+    except IntegratedAuthUnavailable as exc:
+        # Backstop for every command. The transport is built lazily, so this can
+        # surface from anywhere a command first touches it — including outside
+        # that command's own try block, where `discover` used to fail silently
+        # with no output at all.
+        echo(f"\n{exc}")
+        sys.exit(2)
 
 
 if __name__ == "__main__":  # pragma: no cover

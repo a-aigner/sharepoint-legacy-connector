@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ from typer.testing import CliRunner
 
 from conftest import CASES, WEB1, FakeFarm
 from spconnect.cli import app
+from spconnect.cli import run as cli_run
 from spconnect.transport import AuthenticationError
 
 runner = CliRunner()
@@ -538,3 +540,67 @@ def test_probe_rest_stops_on_a_redirecting_base_url(tmp_path: Path, mocked_respo
 
     assert result.exit_code == 2
     assert "SP_BASE_URL=https://sp/sites/service" in result.stdout
+
+
+# --------------------------------------------------------------------------- #
+# SP_AUTH_MODE=integrated with no provider installed
+# --------------------------------------------------------------------------- #
+
+
+def integrated_env(tmp_path: Path) -> Path:
+    path = tmp_path / "integrated.env"
+    path.write_text(
+        f"SP_BASE_URL={WEB1}\nSP_AUTH_MODE=integrated\nSP_REQUESTS_PER_SECOND=10000\n"
+        f"SP_LANDING_DIR={tmp_path / 'l'}\nSP_STATE_FILE={tmp_path / 'l' / 's.json'}\n"
+        "SP_LOG_LEVEL=CRITICAL\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def no_integrated_provider(monkeypatch) -> None:
+    monkeypatch.setattr("spconnect.transport.INTEGRATED_PROVIDERS", ())
+
+
+def test_probe_explains_a_missing_integrated_provider(tmp_path: Path, monkeypatch) -> None:
+    """The finally block used to rebuild the transport that had just failed to build.
+
+    That raised a second exception out of `finally`, discarding the first along
+    with the handler written to explain it — so the operator got exit 1 and no
+    guidance instead of exit 2 and the install instructions.
+    """
+    no_integrated_provider(monkeypatch)
+
+    result = run(integrated_env(tmp_path), "probe")
+
+    assert result.exit_code == 2
+    assert "needs a platform auth provider" in result.stdout
+    # No transport was ever built, so there is no traffic to report.
+    assert "HTTP requests" not in result.stdout
+
+
+def test_every_command_explains_it_not_just_probe(tmp_path: Path, monkeypatch, capsys) -> None:
+    """`discover` builds its crawler outside its try, and used to exit silently.
+
+    Exercised through run(), the console-script entry point, because that is
+    where the backstop lives — CliRunner invokes the typer app directly and
+    would not see it.
+    """
+    no_integrated_provider(monkeypatch)
+    env = integrated_env(tmp_path)
+
+    for command in ("discover", "schema", "crawl", "sync"):
+        monkeypatch.setattr(sys, "argv", ["spconnect", "--env-file", str(env), command])
+        with pytest.raises(SystemExit) as exit_info:
+            cli_run()
+        assert exit_info.value.code == 2, command
+        assert "needs a platform auth provider" in capsys.readouterr().out, command
+
+
+def test_integrated_is_a_valid_auth_mode(tmp_path: Path) -> None:
+    """It was never rejected by config — the blocker is a missing dependency."""
+    from spconnect.config import load_settings
+
+    settings = load_settings(env_file=integrated_env(tmp_path))
+    assert settings.auth_mode == "integrated"
+    assert settings.needs_password is False

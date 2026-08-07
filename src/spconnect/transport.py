@@ -354,16 +354,42 @@ def describe_auth_failure(response: requests.Response, *, auth_mode: str, userna
                 lines.append(f"  body        : {body[:300]}")
             return "\n".join(lines)
 
-        lines.append(
-            f"  server says : rejected it, and re-challenges with {', '.join(schemes)} "
-            "— the credential itself was refused"
-        )
+        lines.append(f"  server says : rejected it, and re-challenges with {', '.join(schemes)}")
         if auth_mode == "ntlm" and username and "\\" not in username and "@" not in username:
             lines.append(
                 f"  username    : '{username}' has no domain part. NTLM usually needs "
                 "DOMAIN\\user (NetBIOS) or user@domain.tld."
             )
-        lines.append("  check       : SP_USERNAME / SP_PASSWORD / SP_AUTH_MODE")
+        if legs >= 3:
+            # A completed handshake that is then refused has several causes and the
+            # password is only one of them. Saying "the credential was refused"
+            # here reads as "reset the account", which is how a farm-side problem
+            # becomes an afternoon spent on a password that was always correct.
+            lines.extend(
+                [
+                    "  reading     : the full three-leg handshake COMPLETED and the final "
+                    "message was refused. That has several causes and only one of them is "
+                    "the password:",
+                    "    1. the challenge and the response reached different servers, or "
+                    "arrived from different client IPs. NTLM binds them together, so a load "
+                    "balancer without session persistence, or a reverse proxy with "
+                    "inconsistent IP passthrough, breaks this while leaving every single "
+                    "GET working.",
+                    "    2. channel bindings: on https the client binds the response to the "
+                    "certificate it sees, which is the wrong one where TLS is terminated by "
+                    "a proxy. Try SP_NTLM_SEND_CBT=false.",
+                    "    3. an LmCompatibilityLevel mismatch between this client, the web "
+                    "front end and the domain controller.",
+                    "    4. the account: wrong password, locked out, or not permitted to log "
+                    "on to this machine over the network.",
+                    "  settle it   : ask the farm admin for the IIS log lines for these "
+                    "requests and read 'sc-win32-status'. 1326 is a bad password; "
+                    "2148074248 (SEC_E_INVALID_TOKEN) is cause 1 or 2; 2148074257 is DNS or "
+                    "domain trust. One number decides where the next hour goes.",
+                ]
+            )
+        else:
+            lines.append("  check       : SP_USERNAME / SP_PASSWORD / SP_AUTH_MODE")
     elif sent:
         lines.append(
             "  server says : no WWW-Authenticate challenge on the rejection — the login "

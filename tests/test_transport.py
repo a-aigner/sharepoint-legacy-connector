@@ -111,6 +111,46 @@ def test_a_rejected_credential_says_so_and_names_the_settings() -> None:
     assert "SP_USERNAME" in message
 
 
+def a_completed_handshake_401() -> requests.Response:
+    """A 401 after all three legs went out — history carries the two earlier ones.
+
+    ``requests-ntlm`` appends the negotiate and challenge exchanges to the final
+    response, so three round trips means the Type 3 was sent and then refused.
+    """
+    response = a_401(challenge="NTLM")
+    response.history = [a_401(challenge="NTLM"), a_401(challenge="NTLM")]
+    return response
+
+
+def test_a_completed_handshake_that_is_refused_does_not_blame_the_password_alone() -> None:
+    """Microsoft's own escalation guidance lists several causes; this used to name one.
+
+    A challenge and response that reach different servers, or arrive from different
+    client IPs, fail exactly like a bad password — and a load balancer without
+    session persistence or a proxy with inconsistent IP passthrough does that while
+    leaving every GET working. Saying "the credential was refused" reads as "reset
+    the account", which is how a farm-side problem becomes an afternoon spent on a
+    password that was always correct.
+    """
+    message = describe_auth_failure(a_completed_handshake_401(), auth_mode="ntlm", username="CONTOSO\\pkober")
+
+    assert "three-leg handshake COMPLETED" in message
+    assert "load balancer without session persistence" in message
+    assert "SP_NTLM_SEND_CBT=false" in message
+    assert "LmCompatibilityLevel" in message
+    # And the one thing that settles it, which is not on this machine.
+    assert "sc-win32-status" in message
+    assert "1326" in message
+
+
+def test_a_handshake_that_never_completed_still_points_at_the_settings() -> None:
+    """One round trip means nothing was negotiated; the causes above do not apply."""
+    message = describe_auth_failure(a_401(challenge="NTLM"), auth_mode="ntlm", username="CONTOSO\\p")
+
+    assert "three-leg handshake COMPLETED" not in message
+    assert "check       : SP_USERNAME / SP_PASSWORD / SP_AUTH_MODE" in message
+
+
 def test_an_authorisation_failure_is_not_reported_as_a_bad_password() -> None:
     """401 *without* a challenge means accepted-then-denied: a permissions problem.
 

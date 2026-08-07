@@ -130,8 +130,9 @@ def test_html_body_with_a_200_is_not_mistaken_for_either_format(
     # neither JSON nor an Atom service document and must not pass as either.
     farm.odata_broken = "odata_not_available.html"
     farm.odata_broken_status = 200
-    with pytest.raises(ODataUnavailable, match="neither JSON nor an Atom service document"):
+    with pytest.raises(ODataUnavailable) as excinfo:
         ODataService(service.transport, WEB1).entity_sets()
+    assert "text/html" in str(excinfo.value), "the message must name what actually arrived"
 
 
 # --------------------------------------------------------------------------- #
@@ -144,14 +145,14 @@ def test_html_body_with_a_200_is_not_mistaken_for_either_format(
 # --------------------------------------------------------------------------- #
 
 
-def test_the_service_document_falls_back_to_atom(farm: FakeFarm, transport: Transport) -> None:
+def test_the_service_document_is_read_as_atom(farm: FakeFarm, transport: Transport) -> None:
     """A farm that only offers AtomPub here is still a farm with REST installed.
 
     Reading a perfectly good Atom document as "the feature is absent" wrote off a
     farm that had been serving REST the whole time, and sent the diagnosis after
     WCF Data Services rather than after the content type we asked for.
     """
-    farm.odata_service_document_json = False
+    farm.odata_format = "atom"
     service = ODataService(transport, WEB1)
 
     assert service.entity_sets() == ["Servicefälle", "Kunden", "Dokumente", "MasterPageGallery"]
@@ -159,25 +160,98 @@ def test_the_service_document_falls_back_to_atom(farm: FakeFarm, transport: Tran
     assert service.entity_set_for("Servicefälle") == "Servicefälle"
 
 
-def test_the_atom_fallback_costs_one_extra_request_and_is_then_cached(
-    farm: FakeFarm, transport: Transport
+@pytest.mark.parametrize("fmt", ["json", "atom"])
+def test_either_representation_costs_exactly_one_request(
+    farm: FakeFarm, transport: Transport, fmt: str
 ) -> None:
-    farm.odata_service_document_json = False
+    """One Accept header covering both formats, so neither farm pays for a probe."""
+    farm.odata_format = fmt
     service = ODataService(transport, WEB1)
     service.entity_sets()
-    service.entity_sets()
-
-    roots = [u for u in farm.odata_requests if u.rstrip("/").endswith("ListData.svc")]
-    assert len(roots) == 2, "one JSON attempt, one Atom fallback, then cached"
-
-
-def test_a_json_service_document_is_still_preferred(farm: FakeFarm, transport: Transport) -> None:
-    """No extra round trip on a farm that does render JSON here."""
-    service = ODataService(transport, WEB1)
     service.entity_sets()
 
     roots = [u for u in farm.odata_requests if u.rstrip("/").endswith("ListData.svc")]
     assert len(roots) == 1
+
+
+def test_an_atom_feed_and_a_json_feed_land_identically(
+    farm: FakeFarm, transport: Transport, mapper: ODataRowMapper
+) -> None:
+    """The whole point of supporting two representations: they must not disagree.
+
+    Same data, one as verbose JSON and one as Atom, compared *through the mapper*
+    because that is where the landing-zone contract lives. If these ever diverge,
+    which content type a farm happens to serve would change what lands on disk,
+    and every cross-backend comparison downstream would be measuring the parser
+    rather than the farm.
+    """
+    farm.odata_format = "json"
+    as_json = ODataService(transport, WEB1).get_items("Servicefälle")
+
+    farm.odata_format = "atom"
+    as_atom = ODataService(transport, WEB1).get_items("Servicefälle")
+
+    assert as_atom.max_id == as_json.max_id == 2
+    assert as_atom.next_link == as_json.next_link
+
+    def columns(row: dict) -> set[str]:
+        # __metadata and friends are annotations, not data, and only one of the
+        # two representations carries them.
+        return {k for k in row if not k.startswith("__")}
+
+    for atom_row, json_row in zip(as_atom.rows, as_json.rows, strict=True):
+        assert columns(atom_row) == columns(json_row), "the same columns arrive either way"
+        _, atom_decoded = mapper.map_row(atom_row)
+        _, json_decoded = mapper.map_row(json_row)
+        assert atom_decoded == json_decoded
+
+
+def test_atom_values_are_typed_the_way_verbose_json_types_them(farm: FakeFarm, transport: Transport) -> None:
+    """Parity is about types as much as presence.
+
+    Edm.Decimal and Edm.Int64 stay **strings** because verbose JSON sends them as
+    strings to avoid float precision loss, and ODataRowMapper coerces those
+    through the SOAP schema. Parsing them to numbers here would make the two
+    backends disagree on every currency column.
+    """
+    farm.odata_format = "atom"
+    rows = ODataService(transport, WEB1).get_items("Servicefälle").rows
+
+    first, second = rows
+    assert first["Id"] == 1 and isinstance(first["Id"], int)
+    assert first["Erledigt"] is True and second["Erledigt"] is False
+    assert first["Kosten"] == "1234.5000000000000", "Edm.Decimal stays a string"
+    assert first["Kategorie"] == {"results": ["Reparatur", "Garantie"]}
+    assert first["Kunde"] == {"Id": 42, "Title": "Müller Maschinenbau GmbH"}
+    assert first["KundeId"] == 42
+    assert second["Meldungen"] is None, "m:null=true is a null, not an empty string"
+    # HTML stored in a note field survives XML escaping intact.
+    assert first["Beschreibung"] == ("<div>Kunde meldet <b>lautes</b> Geräusch &amp; starke Vibration.</div>")
+    # An unexpanded navigation property is reported, not silently dropped.
+    assert first["Attachments"] == {"__deferred": {"uri": "x/Attachments"}}
+
+
+def test_an_expanded_lookup_does_not_leak_into_its_parent(farm: FakeFarm, transport: Transport) -> None:
+    """The trap a descendant search would walk straight into.
+
+    An expanded navigation property carries a whole nested <entry> with its own
+    m:properties. Collecting properties by descendant search would merge the
+    customer's columns into the service case that referenced it — and since both
+    have Id and Title, the parent's own values would be the ones overwritten.
+    """
+    farm.odata_format = "atom"
+    first = ODataService(transport, WEB1).get_items("Servicefälle").rows[0]
+
+    assert first["Id"] == 1, "the case's own Id, not the customer's 42"
+    assert first["Title"] == "Getriebeschaden", "the case's own Title, not 'Müller Maschinenbau GmbH'"
+
+
+def test_an_empty_atom_feed_is_not_an_error(farm: FakeFarm, transport: Transport) -> None:
+    farm.odata_format = "atom"
+    page = ODataService(transport, WEB1).get_items("Kunden")
+    assert page.rows == []
+    assert page.next_link is None
+    assert page.max_id is None
 
 
 # --------------------------------------------------------------------------- #
@@ -293,6 +367,35 @@ def test_odata_backend_produces_the_documented_landing_zone(
     assert items[0]["fields"]["Title"] == "Getriebeschaden"
     assert (list_dir / "items_raw.jsonl").exists()
     assert (list_dir / "list.json").exists()
+
+
+def test_an_atom_only_farm_produces_the_same_landing_zone(
+    tmp_path: Path, farm: FakeFarm, transport: Transport
+) -> None:
+    """End to end on the representation the reported farm actually serves.
+
+    Everything above tests the parser; this tests the crawl. Which content type a
+    farm negotiates must not change what lands on disk, or `SP_API_MODE=odata`
+    would quietly mean two different things depending on the server — and the
+    downstream pipeline upserts on doc_id, so a divergence there duplicates every
+    document in the vector DB rather than failing visibly.
+    """
+    farm.odata_format = "json"
+    as_json = _crawler(tmp_path / "json", transport, api_mode="odata")
+    as_json.settings.state_file = tmp_path / "json" / "landing" / "_state.json"
+    as_json.crawl()
+
+    farm.odata_format = "atom"
+    as_atom = _crawler(tmp_path / "atom", transport, api_mode="odata")
+    as_atom.settings.state_file = tmp_path / "atom" / "landing" / "_state.json"
+    as_atom.crawl()
+
+    json_items = _lines(as_json.landing.list_dir(WEB1, CASES) / "items.jsonl")
+    atom_items = _lines(as_atom.landing.list_dir(WEB1, CASES) / "items.jsonl")
+
+    assert [i["item_id"] for i in atom_items] == [1, 2, 3], "the Atom crawl really ran"
+    assert [i["doc_id"] for i in atom_items] == [i["doc_id"] for i in json_items]
+    assert [i["fields"] for i in atom_items] == [i["fields"] for i in json_items]
 
 
 def test_doc_ids_are_identical_across_both_backends(

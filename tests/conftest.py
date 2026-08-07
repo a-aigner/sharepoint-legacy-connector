@@ -111,10 +111,11 @@ class FakeFarm:
         #: return instead (e.g. an HTML 404 for a farm without the feature).
         self.odata_broken: str | None = None
         self.odata_broken_status: int = 404
-        #: Does the service *document* render as JSON? SharePoint 2010 need not
-        #: offer it in anything but the AtomPub form, while entity sets below it
-        #: still serve JSON quite happily.
-        self.odata_service_document_json: bool = True
+        #: Which representation ListData.svc serves: "json" or "atom". The
+        #: reported SharePoint 2010 farm serves Atom for both the service document
+        #: and the feeds beneath it; OData v2 requires Atom and makes JSON
+        #: optional, so both have to work.
+        self.odata_format: str = "json"
         self._install()
 
     # ---- routing tables ----
@@ -189,22 +190,23 @@ class FakeFarm:
         path = url.split("/ListData.svc", 1)[1]
         query = path.split("?", 1)[1] if "?" in path else ""
         entity = path.split("?", 1)[0].strip("/")
+        atom = self.odata_format == "atom"
 
         if not entity:
-            if self.odata_service_document_json:
-                return 200, {"Content-Type": "application/json"}, fixture("odata_service_document.json")
-            return (
-                200,
-                {"Content-Type": "application/atomsvc+xml;charset=utf-8"},
-                fixture("odata_service_document.atom"),
-            )
+            if atom:
+                content = "application/atomsvc+xml;charset=utf-8"
+                return 200, {"Content-Type": content}, fixture("odata_service_document.atom")
+            return 200, {"Content-Type": "application/json"}, fixture("odata_service_document.json")
+
+        content = "application/atom+xml;charset=utf-8;type=feed" if atom else "application/json"
+        suffix = "atom" if atom else "json"
         if "Servicef" not in entity:
-            return 200, {"Content-Type": "application/json"}, fixture("odata_empty.json")
+            return 200, {"Content-Type": content}, fixture(f"odata_empty.{suffix}")
         # Page on the same Id filter the SOAP backend uses.
         match = re.search(r"Id%20gt%20(\d+)", query) or re.search(r"Id gt (\d+)", query)
         last_id = int(match.group(1)) if match else 0
-        name = {0: "odata_cases_page1.json", 2: "odata_cases_page2.json"}.get(last_id, "odata_empty.json")
-        return 200, {"Content-Type": "application/json"}, fixture(name)
+        stem = {0: "odata_cases_page1", 2: "odata_cases_page2"}.get(last_id, "odata_empty")
+        return 200, {"Content-Type": content}, fixture(f"{stem}.{suffix}")
 
     def _dispatch(self, request: Any) -> tuple[int, dict[str, str], str]:
         parsed = ParsedRequest(request.body, request.headers.get("SOAPAction"))

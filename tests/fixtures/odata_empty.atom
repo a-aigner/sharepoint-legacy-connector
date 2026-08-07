@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<feed xml:base="http://sp/sites/service/_vti_bin/ListData.svc/"
+      xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices"
+      xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata"
+      xmlns="http://www.w3.org/2005/Atom">
+  <title type="text">Servicefälle</title>
+  <id>http://sp/sites/service/_vti_bin/ListData.svc/Servicef%C3%A4lle</id>
+  <updated>2011-07-02T15:43:00Z</updated>
+  <link rel="self" title="Servicefälle" href="Servicefälle" />
+</feed>

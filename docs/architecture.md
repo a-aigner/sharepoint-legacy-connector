@@ -132,7 +132,17 @@ fills.
 |---|---|---|
 | Endpoint | `Lists.asmx` `GetListItems` | `_vti_bin/ListData.svc` |
 | Builds | 2003 → 2016 | 2010+ |
-| Values | `ows_` strings → `decode.py` | typed JSON → `ODataRowMapper` |
+| Values | `ows_` strings → `decode.py` | typed JSON **or Atom** → `ODataRowMapper` |
+
+`ListData.svc` is read in whichever of the two OData v2 representations the farm
+serves. One `Accept` header asks for both, so it costs a single request either
+way, and the response's content type decides the parser. JSON is preferred where
+it is offered — it needs no EDM type table — but **Atom is what OData v2 requires
+a service to speak, and JSON is optional**: the reported SharePoint 2010 farm
+serves Atom for the service document and for feeds alike. Both decode to the same
+rows and the same landing zone, which `test_an_atom_only_farm_produces_the_same_landing_zone`
+pins end to end — the downstream pipeline upserts on `doc_id`, so a divergence
+there would duplicate every document rather than fail visibly.
 
 These stay on SOAP in **both** modes, because OData has no equivalent:
 

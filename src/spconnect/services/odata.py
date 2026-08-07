@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import requests
 from lxml import etree
 
 from ..config import get_logger
@@ -55,6 +56,154 @@ _ODATA_DATE_RE = re.compile(r"^/Date\((-?\d+)(?:([+-])(\d{2})(\d{2}))?\)/$")
 #: Keys the service adds to every entity that are not list data.
 _CONTROL_KEYS = frozenset({"__metadata", "__deferred", "__next", "__count"})
 
+_ATOM_NS = "http://www.w3.org/2005/Atom"
+#: ``d:`` — where property values live.
+_DS_NS = "http://schemas.microsoft.com/ado/2007/08/dataservices"
+#: ``m:`` — where the type, null and inline annotations live.
+_DSM_NS = "http://schemas.microsoft.com/ado/2007/08/dataservices/metadata"
+
+_ATOM_ENTRY = f"{{{_ATOM_NS}}}entry"
+_ATOM_FEED = f"{{{_ATOM_NS}}}feed"
+_ATOM_LINK = f"{{{_ATOM_NS}}}link"
+_ATOM_CONTENT = f"{{{_ATOM_NS}}}content"
+_M_PROPERTIES = f"{{{_DSM_NS}}}properties"
+_M_INLINE = f"{{{_DSM_NS}}}inline"
+_M_TYPE = f"{{{_DSM_NS}}}type"
+_M_NULL = f"{{{_DSM_NS}}}null"
+
+#: ``rel`` prefix marking a navigation property rather than an ordinary Atom link.
+_RELATED = "/related/"
+
+#: EDM types that become Python ints. **Not** ``Edm.Int64``: OData's verbose JSON
+#: sends 64-bit and decimal values as *strings* to avoid float precision loss, and
+#: :class:`ODataRowMapper` coerces those through the SOAP schema. Parsing them to
+#: numbers here would make the two backends disagree on every currency column.
+_EDM_INT = frozenset({"Edm.Int16", "Edm.Int32", "Edm.Byte", "Edm.SByte"})
+_EDM_FLOAT = frozenset({"Edm.Double", "Edm.Single"})
+
+#: JSON is preferred where a farm offers it — it needs no type table and is what
+#: the landing-zone contract was defined against — but Atom is what OData v2
+#: *requires* a service to speak, so it is always acceptable. Asking for both in
+#: one header keeps this to a single request on either kind of farm, with no
+#: negotiation state to remember and nothing to get stale between webs.
+_ACCEPT_ENTITIES = "application/json;q=1.0, application/atom+xml;q=0.9, application/xml;q=0.8"
+_ACCEPT_SERVICE_DOCUMENT = "application/json;q=1.0, application/atomsvc+xml;q=0.9, application/xml;q=0.8"
+
+
+def _local(tag: Any) -> str:
+    """Local name of an element tag, ignoring its namespace."""
+    return str(tag).rsplit("}", 1)[-1]
+
+
+def parse_atom_value(el: etree._Element) -> Any:
+    """One ``<d:Property m:type="...">`` element as the JSON backend would send it.
+
+    The target is deliberately *verbose-JSON parity* rather than the most natural
+    Python value, because :class:`ODataRowMapper` and the landing-zone contract
+    are already defined against the JSON shape. Anything else here would make the
+    two backends produce different output for the same row, which is the one thing
+    having two backends is supposed to let us rule out.
+    """
+    if (el.get(_M_NULL) or "").strip().lower() == "true":
+        return None
+
+    edm = el.get(_M_TYPE) or "Edm.String"
+
+    # A property with child elements is a collection — a multi-choice or
+    # multi-lookup column. Verbose JSON wraps those in {"results": [...]}, so the
+    # children's text goes into the same shape whatever the wrapper is called.
+    children = list(el)
+    if children:
+        return {"results": [child.text or "" for child in children]}
+
+    text = el.text or ""
+    if edm == "Edm.Boolean":
+        return text.strip().lower() == "true"
+    if edm in _EDM_INT:
+        try:
+            return int(text.strip())
+        except ValueError:
+            log.warning("odata.atom_int_unparseable", property=_local(el.tag), raw=text[:50])
+            return text
+    if edm in _EDM_FLOAT:
+        try:
+            return float(text.strip())
+        except ValueError:
+            log.warning("odata.atom_float_unparseable", property=_local(el.tag), raw=text[:50])
+            return text
+    # Everything else stays a string, Edm.DateTime included: ODataRowMapper runs
+    # parse_odata_datetime over it, which reads Atom's ISO form and JSON's
+    # /Date(ms)/ form to the same instant.
+    return text
+
+
+def _own_properties(entry: etree._Element) -> etree._Element | None:
+    """The ``m:properties`` belonging to *this* entry.
+
+    Direct-child lookups only, and never a descendant search: an expanded
+    navigation property carries a whole nested ``<entry>`` with properties of its
+    own, and a descendant search would merge a customer's columns into the service
+    case that referenced it.
+
+    Two valid positions — under ``content`` for an ordinary entry, and as a
+    sibling of it for a media-link entry, which is what a document library's rows
+    are.
+    """
+    content = entry.find(_ATOM_CONTENT)
+    if content is not None:
+        found = content.find(_M_PROPERTIES)
+        if found is not None:
+            return found
+    return entry.find(_M_PROPERTIES)
+
+
+def atom_entry_to_dict(entry: etree._Element) -> dict[str, Any]:
+    """One ``<entry>`` as the dict the JSON backend would have produced."""
+    row: dict[str, Any] = {}
+
+    properties = _own_properties(entry)
+    if properties is not None:
+        for prop in properties:
+            row[_local(prop.tag)] = parse_atom_value(prop)
+
+    # Navigation properties. Direct-child links only, for the same reason as above.
+    for link in entry.findall(_ATOM_LINK):
+        rel = link.get("rel") or ""
+        if _RELATED not in rel:
+            continue
+        name = rel.rsplit(_RELATED, 1)[1]
+        if not name:
+            continue
+        inline = link.find(_M_INLINE)
+        if inline is None:
+            # Unexpanded, exactly as JSON reports it. ODataRowMapper skips these;
+            # emitting the same marker keeps the raw record identical too.
+            row[name] = {"__deferred": {"uri": link.get("href") or ""}}
+            continue
+        nested_feed = inline.find(_ATOM_FEED)
+        if nested_feed is not None:
+            rows, _ = parse_atom_feed(nested_feed)
+            row[name] = {"results": rows}
+            continue
+        nested_entry = inline.find(_ATOM_ENTRY)
+        if nested_entry is not None:
+            row[name] = atom_entry_to_dict(nested_entry)
+    return row
+
+
+def parse_atom_feed(feed: etree._Element) -> tuple[list[dict[str, Any]], str | None]:
+    """``(rows, next_link)`` from an OData v2 Atom feed.
+
+    ``findall`` rather than ``xpath``: both the entries and the ``rel="next"``
+    link must come from this feed and not from one inlined inside an entry.
+    """
+    rows = [atom_entry_to_dict(entry) for entry in feed.findall(_ATOM_ENTRY)]
+    next_link = next(
+        (link.get("href") for link in feed.findall(_ATOM_LINK) if (link.get("rel") or "") == "next"),
+        None,
+    )
+    return rows, next_link
+
 
 class ODataError(TransportError):
     """``ListData.svc`` answered, but not usefully."""
@@ -65,13 +214,24 @@ class ODataUnavailable(ODataError):
 
 
 class ODataNotJson(ODataError):
-    """The service answered, but not as JSON. It may still speak Atom.
+    """The service claimed JSON and did not deliver it.
 
     Deliberately **not** a subclass of :class:`ODataUnavailable`: a body that is
     not JSON is not evidence that the feature is missing, and conflating the two
     is how a farm serving Atom got reported as needing WCF Data Services
     installed. Subclasses :class:`ODataError` so the crawler's fall-back-to-SOAP
     path still catches it.
+    """
+
+
+class ODataNotAtom(ODataUnavailable):
+    """Neither JSON nor parseable XML.
+
+    Unlike :class:`ODataNotJson` this *is* an :class:`ODataUnavailable`. OData v2
+    requires a service to speak Atom, so a body that is neither representation is
+    not the service answering in an inconvenient format — it is something else
+    answering in the service's place, which is what "absent, disabled, or broken"
+    means.
     """
 
 
@@ -130,6 +290,10 @@ class ODataService:
         self.transport = transport
         self.web_url = normalise_url(web_url)
         self._entity_sets: list[str] | None = None
+        #: ``"json"`` or ``"atom"`` once anything has been read. Worth reporting:
+        #: it is the difference between a farm this connector had to be taught to
+        #: read and one it always could, and the operator cannot see it otherwise.
+        self.representation: str | None = None
 
     @property
     def endpoint(self) -> str:
@@ -137,9 +301,10 @@ class ODataService:
 
     # ---- raw requests ----
 
-    def _get_json(self, url: str) -> dict[str, Any]:
+    def _get(self, url: str, *, accept: str) -> requests.Response:
+        """One GET with ListData.svc's failure modes named. Never returns a >=400."""
         try:
-            response = self.transport.request("GET", url, headers={"Accept": "application/json"})
+            response = self.transport.request("GET", url, headers={"Accept": accept})
         except AuthenticationError:
             raise  # a bad credential is not an OData problem
         except NotFoundError as exc:
@@ -148,19 +313,44 @@ class ODataService:
             ) from exc
         if response.status_code >= 400:
             raise ODataError(f"HTTP {response.status_code} for {url}: {response.text[:300]}")
+        return response
+
+    @staticmethod
+    def _is_json(response: requests.Response) -> bool:
+        """Which of the two representations came back.
+
+        Content type first, then the first non-space byte. The sniff matters: a
+        farm that ignores ``Accept`` entirely still has to be read correctly, and
+        ``{`` versus ``<`` is not an ambiguous distinction between these two.
+        """
+        content_type = (response.headers.get("Content-Type") or "").lower()
+        if "json" in content_type:
+            return True
+        if "xml" in content_type or "atom" in content_type:
+            return False
+        return response.content.lstrip()[:1] == b"{"
+
+    def _parse_json(self, url: str, response: requests.Response) -> dict[str, Any]:
         try:
             payload = json.loads(response.content.decode("utf-8", "replace"))
         except json.JSONDecodeError as exc:
-            # Atom, or an error page from a farm without the feature. Which of
-            # those it is cannot be told from here, so say what arrived and let
-            # the caller decide whether Atom is worth a try.
             raise ODataNotJson(
-                f"{url} did not return JSON ({response.headers.get('Content-Type')}); "
-                f"first 200 bytes: {response.content[:200]!r}"
+                f"{url} claimed to return JSON ({response.headers.get('Content-Type')}) "
+                f"but did not; first 200 bytes: {response.content[:200]!r}"
             ) from exc
         if not isinstance(payload, dict) or "d" not in payload:
             raise ODataNotJson(f"{url}: response had no 'd' envelope")
         return payload
+
+    def _parse_atom(self, url: str, response: requests.Response) -> etree._Element:
+        try:
+            return etree.fromstring(response.content)
+        except etree.XMLSyntaxError as exc:
+            raise ODataNotAtom(
+                f"{url} returned neither JSON nor well-formed XML "
+                f"({response.headers.get('Content-Type')}); "
+                f"first 200 bytes: {response.content[:200]!r}"
+            ) from exc
 
     @staticmethod
     def _results(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
@@ -190,22 +380,33 @@ class ODataService:
         the content type we asked for.
         """
         if self._entity_sets is None:
-            try:
-                names = self._entity_sets_from_json()
-            except ODataNotJson as exc:
-                log.info(
-                    "odata.service_document.not_json",
-                    web=self.web_url,
-                    detail="service document is not JSON; reading it as AtomPub instead",
-                    content=str(exc).split(";", 1)[0],
+            url = self.endpoint + "/"
+            response = self._get(url, accept=_ACCEPT_SERVICE_DOCUMENT)
+            if self._is_json(response):
+                self.representation = "json"
+                names = self._service_document_json(url, response)
+            else:
+                self.representation = "atom"
+                names = self._service_document_atom(response)
+            if not names:
+                raise ODataUnavailable(
+                    f"{url} answered, but named no entity sets "
+                    f"({response.headers.get('Content-Type')}); "
+                    f"first 200 bytes: {response.content[:200]!r}\n"
+                    "  A 404 would mean the feature is not installed. This is something "
+                    "else answering in its place."
                 )
-                names = self._entity_sets_from_atom(json_error=exc)
             self._entity_sets = names
-            log.info("odata.service_document", web=self.web_url, entity_sets=len(names))
+            log.info(
+                "odata.service_document",
+                web=self.web_url,
+                entity_sets=len(names),
+                representation=self.representation,
+            )
         return self._entity_sets
 
-    def _entity_sets_from_json(self) -> list[str]:
-        payload = self._get_json(self.endpoint + "/")
+    def _service_document_json(self, url: str, response: requests.Response) -> list[str]:
+        payload = self._parse_json(url, response)
         rows, _ = self._results(payload)
         names = []
         for row in rows:
@@ -216,41 +417,19 @@ class ODataService:
             names = [k for k in payload["d"] if k not in _CONTROL_KEYS]
         return names
 
-    def _entity_sets_from_atom(self, *, json_error: ODataNotJson) -> list[str]:
+    def _service_document_atom(self, response: requests.Response) -> list[str]:
         """Read ``<collection href="...">`` out of an AtomPub service document.
 
-        ``href`` rather than ``atom:title``: it is the URL segment, which is what
-        every later request is built from. The two usually agree, and where a
-        sanitiser has made them disagree the one that routes is the one we want.
+        ``href`` rather than ``atom:title``: it is the URL segment every later
+        request is built from. The two usually agree, and where a sanitiser has
+        made them disagree the one that routes is the one we want.
 
-        Namespace-agnostic, because the document mixes the ``app`` and ``atom``
-        namespaces and older builds disagree about which is the default.
+        Namespace-agnostic via :func:`~spconnect.soap.find_all`, because the
+        document mixes the ``app`` and ``atom`` namespaces and older builds
+        disagree about which one is the default.
         """
-        url = self.endpoint + "/"
-        response = self.transport.request(
-            "GET", url, headers={"Accept": "application/atomsvc+xml, application/xml, text/xml"}
-        )
-        names: list[str] = []
-        try:
-            root = etree.fromstring(response.content)
-        except etree.XMLSyntaxError:
-            root = None
-        if root is not None:
-            for collection in find_all(root, "collection"):
-                href = collection.get("href")
-                if href:
-                    names.append(href)
-
-        if not names:
-            raise ODataUnavailable(
-                f"{url} returned neither JSON nor an Atom service document.\n"
-                f"  as JSON: {json_error}\n"
-                f"  as Atom: {response.headers.get('Content-Type')}, no <collection> elements in "
-                f"{response.content[:200]!r}\n"
-                "  A 404 would mean the feature is not installed; this is something else "
-                "answering in its place."
-            )
-        return names
+        root = self._parse_atom(self.endpoint + "/", response)
+        return [href for c in find_all(root, "collection") if (href := c.get("href"))]
 
     def available(self) -> tuple[bool, str | None]:
         """Is ListData.svc usable on this web? Never raises."""
@@ -302,8 +481,13 @@ class ODataService:
         url = f"{self.endpoint}/{entity_set}?" + "&".join(query)
         log.debug("odata.query", entity_set=entity_set, last_id=last_id, top=top, url=url)
 
-        payload = self._get_json(url)
-        rows, next_link = self._results(payload)
+        response = self._get(url, accept=_ACCEPT_ENTITIES)
+        if self._is_json(response):
+            self.representation = "json"
+            rows, next_link = self._results(self._parse_json(url, response))
+        else:
+            self.representation = "atom"
+            rows, next_link = parse_atom_feed(self._parse_atom(url, response))
         page = ODataPage(rows=[r for r in rows if isinstance(r, dict)], next_link=next_link)
         log.debug("odata.page", entity_set=entity_set, rows=len(page.rows), max_id=page.max_id)
         return page

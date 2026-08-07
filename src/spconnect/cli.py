@@ -516,7 +516,7 @@ def probe_rest(ctx: typer.Context) -> None:
             try:
                 sets = service.entity_sets()
                 rest = "ok"
-                st.detail(f"{len(sets)} entity sets")
+                st.detail(f"{len(sets)} entity sets, served as {service.representation}")
             except AuthenticationError as exc:
                 # Recorded, not raised: a refused GET is exactly the measurement
                 # this command came for.

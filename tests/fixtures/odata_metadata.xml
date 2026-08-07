@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<edmx:Edmx Version="1.0" xmlns:edmx="http://schemas.microsoft.com/ado/2007/06/edmx">
+  <edmx:DataServices xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata"
+                     m:DataServiceVersion="2.0">
+    <Schema Namespace="Microsoft.SharePoint.DataService"
+            xmlns="http://schemas.microsoft.com/ado/2006/04/edm">
+      <EntityType Name="ServicefälleItem">
+        <Key><PropertyRef Name="Id" /></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false" />
+      </EntityType>
+      <EntityContainer Name="ServiceDataContext" m:IsDefaultEntityContainer="true">
+        <EntitySet Name="Servicefälle" EntityType="Microsoft.SharePoint.DataService.ServicefälleItem" />
+        <EntitySet Name="Kunden" EntityType="Microsoft.SharePoint.DataService.KundenItem" />
+        <EntitySet Name="Dokumente" EntityType="Microsoft.SharePoint.DataService.DokumenteItem" />
+        <EntitySet Name="MasterPageGallery" EntityType="Microsoft.SharePoint.DataService.MasterPageGalleryItem" />
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>

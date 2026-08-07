@@ -7,10 +7,12 @@ tests here are the ones asserting that both produce the *same landing zone*.
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+import responses
 
 from conftest import CASES, WEB1, FakeFarm, make_settings
 from spconnect.crawl import Crawler
@@ -143,6 +145,74 @@ def test_html_body_with_a_200_is_not_mistaken_for_either_format(
 # definition and whether a given WCF Data Services build will emit JSON for it is
 # version-dependent — SharePoint 2010's need not.
 # --------------------------------------------------------------------------- #
+
+
+def test_the_wcf_json_service_document_shape_is_read(farm: FakeFarm, transport: Transport) -> None:
+    """``{"d":{"EntitySets":[...]}}`` — what WCF Data Services actually sends.
+
+    Reading only the AtomPub-derived ``{"d":[{"name":...}]}`` listing found no
+    names here, and the old key-name fallback then reported a single collection
+    literally called ``EntitySets``, which 404'd. So a farm serving REST perfectly
+    well came out as one bogus unreadable collection.
+    """
+    farm.odata_service_document_shape = "entitysets"
+
+    names = ODataService(transport, WEB1).entity_sets()
+
+    assert names == ["Servicefälle", "Kunden", "Dokumente", "MasterPageGallery"]
+    assert "EntitySets" not in names
+
+
+def test_the_named_json_service_document_shape_still_works(farm: FakeFarm, transport: Transport) -> None:
+    farm.odata_service_document_shape = "named"
+
+    assert ODataService(transport, WEB1).entity_sets() == [
+        "Servicefälle",
+        "Kunden",
+        "Dokumente",
+        "MasterPageGallery",
+    ]
+
+
+def test_a_json_key_is_never_mistaken_for_a_collection(farm: FakeFarm, transport: Transport) -> None:
+    """The guess that produced `EntitySets` must not come back in another form.
+
+    Taking the envelope's own keys as collection names cannot be right: a key is
+    the name of a *field in the response*, and the only thing that made it look
+    plausible was that it was a string in roughly the right place.
+    """
+    farm.odata_service_document_shape = "unknown"
+    farm.mock.reset()
+    farm.mock.add_callback(
+        responses.GET,
+        re.compile(re.escape(f"{WEB1}/_vti_bin/ListData.svc") + r".*"),
+        callback=lambda request: (
+            200,
+            {"Content-Type": "application/json"},
+            '{"d": {"SomethingElse": {"nested": 1}}}',
+        ),
+    )
+
+    with pytest.raises(ODataUnavailable) as excinfo:
+        ODataService(transport, WEB1).entity_sets()
+    assert "SomethingElse" not in str(excinfo.value).split("first 200 bytes")[0]
+
+
+def test_metadata_is_the_fallback_when_the_service_document_will_not_answer(
+    farm: FakeFarm, transport: Transport
+) -> None:
+    """$metadata names every collection authoritatively, and is always XML.
+
+    Confirmed reachable on the reported farm. It is the better source of truth
+    anyway — `<EntitySet Name="...">` is the routing name, stated by the service
+    rather than derived from a listing.
+    """
+    farm.odata_service_document_ok = False
+
+    service = ODataService(transport, WEB1)
+    assert service.entity_sets() == ["Servicefälle", "Kunden", "Dokumente", "MasterPageGallery"]
+    assert service.representation == "metadata"
+    assert any(u.endswith("$metadata") for u in farm.odata_requests)
 
 
 def test_the_service_document_is_asked_for_by_its_bare_url(farm: FakeFarm, transport: Transport) -> None:

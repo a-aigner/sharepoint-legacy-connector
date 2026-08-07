@@ -113,10 +113,17 @@ class FakeFarm:
         self.odata_broken: str | None = None
         self.odata_broken_status: int = 404
         #: Which representation ListData.svc serves: "json" or "atom". The
-        #: reported SharePoint 2010 farm serves Atom for both the service document
-        #: and the feeds beneath it; OData v2 requires Atom and makes JSON
-        #: optional, so both have to work.
+        #: reported SharePoint 2010 farm serves Atom to a browser and JSON when
+        #: asked for it; OData v2 requires Atom and makes JSON optional, so both
+        #: have to work.
         self.odata_format: str = "json"
+        #: Which JSON shape the *service document* uses. WCF Data Services sends
+        #: ``{"d":{"EntitySets":[...]}}``; the AtomPub-derived listing that older
+        #: notes describe is ``{"d":[{"name":...}]}``. Both are real.
+        self.odata_service_document_shape: str = "entitysets"
+        #: Does the service document answer at all? When it does not, $metadata is
+        #: the authoritative fallback for collection names.
+        self.odata_service_document_ok: bool = True
         #: Does the farm implement the ``$count`` path segment? Some builds and
         #: some proxies in front of them do not, which is why there is a fallback.
         self.odata_supports_count: bool = True
@@ -225,11 +232,20 @@ class FakeFarm:
                 f'{{"d": {{"results": [], "__count": "{total}"}}}}',
             )
 
+        if entity == "$metadata":
+            return 200, {"Content-Type": "application/xml;charset=utf-8"}, fixture("odata_metadata.xml")
+
         if not entity:
+            if not self.odata_service_document_ok:
+                return 404, {"Content-Type": "text/html"}, "<html>not found</html>"
             if atom:
                 content = "application/atomsvc+xml;charset=utf-8"
                 return 200, {"Content-Type": content}, fixture("odata_service_document.atom")
-            return 200, {"Content-Type": "application/json"}, fixture("odata_service_document.json")
+            name = {
+                "entitysets": "odata_service_document_entitysets.json",
+                "named": "odata_service_document.json",
+            }[self.odata_service_document_shape]
+            return 200, {"Content-Type": "application/json"}, fixture(name)
 
         content = "application/atom+xml;charset=utf-8;type=feed" if atom else "application/json"
         suffix = "atom" if atom else "json"

@@ -616,7 +616,7 @@ def test_explore_works_in_either_representation(env_file: Path, farm: FakeFarm, 
     result = run(env_file, "explore")
 
     assert result.exit_code == 0
-    assert f"served as {fmt}" in result.stdout
+    assert f"ListData.svc ({fmt})" in result.stdout
     assert "6 entries in total" in result.stdout
 
 

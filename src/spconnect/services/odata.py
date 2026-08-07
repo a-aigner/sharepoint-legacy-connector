@@ -380,45 +380,106 @@ class ODataService:
         the content type we asked for.
         """
         if self._entity_sets is None:
-            # Bare `…/ListData.svc`, with no trailing slash and nothing appended.
-            # The slash is optional in the OData spec and not free in practice:
-            # IIS of this vintage can treat `ListData.svc/` as a path below the
-            # handler and answer 404 for a service that is running perfectly well.
-            url = self.endpoint
-            response = self._get(url, accept=_ACCEPT_SERVICE_DOCUMENT)
-            if self._is_json(response):
-                self.representation = "json"
-                names = self._service_document_json(url, response)
-            else:
-                self.representation = "atom"
-                names = self._service_document_atom(response)
+            names, note = self._read_service_document()
             if not names:
-                raise ODataUnavailable(
-                    f"{url} answered, but named no collections "
-                    f"({response.headers.get('Content-Type')}); "
-                    f"first 200 bytes: {response.content[:200]!r}\n"
-                    "  A 404 would mean the feature is not installed. This is something "
-                    "else answering in its place."
-                )
+                names = self._collections_from_metadata(because=note)
             self._entity_sets = names
             log.info(
-                "odata.service_document",
+                "odata.collections",
                 web=self.web_url,
-                entity_sets=len(names),
+                collections=len(names),
                 representation=self.representation,
             )
         return self._entity_sets
 
+    def _read_service_document(self) -> tuple[list[str], str]:
+        """``(collections, why_it_was_empty)``. Never raises for an empty answer.
+
+        An unhelpful service document is not a dead service — ``$metadata`` names
+        the same collections and is reachable independently — so this reports and
+        the caller escalates.
+        """
+        # Bare `…/ListData.svc`, with no trailing slash and nothing appended. The
+        # slash is optional in the OData spec and not free in practice: IIS of this
+        # vintage can treat `ListData.svc/` as a path below the handler and answer
+        # 404 for a service that is running perfectly well.
+        url = self.endpoint
+        try:
+            response = self._get(url, accept=_ACCEPT_SERVICE_DOCUMENT)
+        except ODataUnavailable as exc:
+            return [], str(exc).splitlines()[0]
+
+        if self._is_json(response):
+            self.representation = "json"
+            names = self._service_document_json(url, response)
+        else:
+            self.representation = "atom"
+            names = self._service_document_atom(response)
+        if names:
+            return names, ""
+        return [], (
+            f"{url} answered {response.headers.get('Content-Type')} but named no "
+            f"collections; first 200 bytes: {response.content[:200]!r}"
+        )
+
     def _service_document_json(self, url: str, response: requests.Response) -> list[str]:
+        """Collection names out of a JSON service document, in either real shape.
+
+        WCF Data Services sends ``{"d": {"EntitySets": ["Ticket", ...]}}``. The
+        AtomPub-derived listing, ``{"d": [{"name": "Ticket", "url": "Ticket"}]}``,
+        also exists. Both are read; anything else yields nothing.
+
+        There used to be a third branch that took the envelope's own **keys** as
+        collection names when neither shape matched. That is what turned a farm
+        serving the first shape into a single collection literally called
+        ``EntitySets``, which then 404'd — a guess dressed up as a finding. A key
+        names a field in the response, never a list on the farm, so there is no
+        shape in which that inference is sound and it is gone.
+        """
         payload = self._parse_json(url, response)
+        body = payload["d"]
+
+        if isinstance(body, dict):
+            declared = body.get("EntitySets")
+            if isinstance(declared, list):
+                return [n for n in declared if isinstance(n, str) and n]
+
         rows, _ = self._results(payload)
-        names = []
-        for row in rows:
-            name = row.get("name") if isinstance(row, dict) else None
-            if isinstance(name, str):
-                names.append(name)
-        if not names and isinstance(payload["d"], dict):
-            names = [k for k in payload["d"] if k not in _CONTROL_KEYS]
+        return [
+            row["name"]
+            for row in rows
+            if isinstance(row, dict) and isinstance(row.get("name"), str) and row["name"]
+        ]
+
+    def _collections_from_metadata(self, *, because: str) -> list[str]:
+        """``<EntitySet Name="...">`` from ``$metadata``. Always XML, by definition.
+
+        The better source of truth, kept as the fallback only because it is the
+        larger download: the service *states* these names rather than leaving them
+        to be read out of a listing, and EDMX has one representation so there is no
+        content type to negotiate.
+        """
+        url = f"{self.endpoint}/$metadata"
+        try:
+            response = self._get(url, accept="application/xml, text/xml")
+            root = self._parse_atom(url, response)
+        except ODataError as exc:
+            raise ODataUnavailable(
+                f"Could not learn which collections {self.endpoint} exposes.\n"
+                f"  service document: {because or 'named none'}\n"
+                f"  $metadata       : {str(exc).splitlines()[0]}"
+            ) from exc
+
+        names = [name for el in find_all(root, "EntitySet") if (name := el.get("Name"))]
+        if not names:
+            raise ODataUnavailable(
+                f"Could not learn which collections {self.endpoint} exposes.\n"
+                f"  service document: {because or 'named none'}\n"
+                f"  $metadata       : no <EntitySet Name=...> elements in "
+                f"{response.content[:200]!r}"
+            )
+        self.representation = "metadata"
+        log.info("odata.collections_from_metadata", web=self.web_url, collections=len(names))
         return names
 
     def _service_document_atom(self, response: requests.Response) -> list[str]:

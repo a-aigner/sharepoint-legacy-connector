@@ -579,8 +579,7 @@ def explore(
 def _render_exploration(settings: Settings, service: ODataService, counted: list[CollectionCount]) -> None:
     echo(f"spconnect explore -> {settings.base_url}")
     echo("─" * min(len(settings.base_url) + 20, 78))
-    echo(f"  ListData.svc served as {service.representation}, {len(counted)} collection(s)")
-    echo("  This web only — enumerating subwebs would need SOAP.")
+    echo(f"  {len(counted)} collection(s) in this web, read from ListData.svc ({service.representation})")
     echo("")
 
     width = max((len(c.name) for c in counted), default=10)

@@ -111,6 +111,10 @@ class FakeFarm:
         #: return instead (e.g. an HTML 404 for a farm without the feature).
         self.odata_broken: str | None = None
         self.odata_broken_status: int = 404
+        #: Does the service *document* render as JSON? SharePoint 2010 need not
+        #: offer it in anything but the AtomPub form, while entity sets below it
+        #: still serve JSON quite happily.
+        self.odata_service_document_json: bool = True
         self._install()
 
     # ---- routing tables ----
@@ -187,7 +191,13 @@ class FakeFarm:
         entity = path.split("?", 1)[0].strip("/")
 
         if not entity:
-            return 200, {"Content-Type": "application/json"}, fixture("odata_service_document.json")
+            if self.odata_service_document_json:
+                return 200, {"Content-Type": "application/json"}, fixture("odata_service_document.json")
+            return (
+                200,
+                {"Content-Type": "application/atomsvc+xml;charset=utf-8"},
+                fixture("odata_service_document.atom"),
+            )
         if "Servicef" not in entity:
             return 200, {"Content-Type": "application/json"}, fixture("odata_empty.json")
         # Page on the same Id filter the SOAP backend uses.

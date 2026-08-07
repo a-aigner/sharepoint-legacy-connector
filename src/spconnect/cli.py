@@ -528,8 +528,11 @@ def probe_rest(ctx: typer.Context) -> None:
                 st.ok = False
                 st.note(str(exc).splitlines()[0])
                 st.note(
-                    "This is the feature missing, not the credential being refused — "
-                    "ListData.svc needs WCF Data Services on the farm."
+                    "Either way this is not the credential being refused. A 404 is the "
+                    "feature missing — ListData.svc needs WCF Data Services on the farm. "
+                    "Any other body is something answering in its place; a service that "
+                    "merely speaks Atom rather than JSON is read as Atom and does not "
+                    "land here."
                 )
             except Exception as exc:
                 rest = "error"

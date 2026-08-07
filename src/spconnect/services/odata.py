@@ -15,7 +15,7 @@ do the rest:
 What OData does give us is typed values — real numbers, booleans and dates —
 which is worth being able to compare against the ``ows_`` decoder on real data.
 
-Two documented traps drive the design:
+Three documented traps drive the design:
 
 1. Entity-set names are *derived* from list titles: spaces removed, words
    capitalised, non-ASCII mangled (``My Test ïist`` -> ``MyTestÏist``). We never
@@ -24,6 +24,12 @@ Two documented traps drive the design:
    mandatory. We page on ``Id`` exactly as the SOAP backend does, which keeps
    the same resumable checkpoints and stays index-seekable under the 5000-item
    threshold.
+3. The service **document** need not be available as JSON. Feeds and entities
+   render as JSON on request, but the document at the service root is AtomPub by
+   definition and whether a given WCF Data Services build will emit JSON for it
+   is version-dependent — the reported SharePoint 2010 farm serves ``.atom``
+   there. So we ask for JSON, and read Atom when that is what arrives, rather
+   than concluding the feature is missing.
 """
 
 from __future__ import annotations
@@ -34,8 +40,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from lxml import etree
+
 from ..config import get_logger
 from ..models import ListSchema, normalise_url
+from ..soap import find_all
 from ..transport import AuthenticationError, NotFoundError, Transport, TransportError
 
 log = get_logger(__name__)
@@ -53,6 +62,17 @@ class ODataError(TransportError):
 
 class ODataUnavailable(ODataError):
     """The service is absent, disabled, or broken on this web."""
+
+
+class ODataNotJson(ODataError):
+    """The service answered, but not as JSON. It may still speak Atom.
+
+    Deliberately **not** a subclass of :class:`ODataUnavailable`: a body that is
+    not JSON is not evidence that the feature is missing, and conflating the two
+    is how a farm serving Atom got reported as needing WCF Data Services
+    installed. Subclasses :class:`ODataError` so the crawler's fall-back-to-SOAP
+    path still catches it.
+    """
 
 
 def normalise_name(name: str, *, ascii_only: bool = False) -> str:
@@ -131,13 +151,15 @@ class ODataService:
         try:
             payload = json.loads(response.content.decode("utf-8", "replace"))
         except json.JSONDecodeError as exc:
-            # A farm without the OData feature returns HTML here.
-            raise ODataUnavailable(
+            # Atom, or an error page from a farm without the feature. Which of
+            # those it is cannot be told from here, so say what arrived and let
+            # the caller decide whether Atom is worth a try.
+            raise ODataNotJson(
                 f"{url} did not return JSON ({response.headers.get('Content-Type')}); "
                 f"first 200 bytes: {response.content[:200]!r}"
             ) from exc
         if not isinstance(payload, dict) or "d" not in payload:
-            raise ODataError(f"{url}: response had no 'd' envelope")
+            raise ODataNotJson(f"{url}: response had no 'd' envelope")
         return payload
 
     @staticmethod
@@ -156,20 +178,79 @@ class ODataService:
     # ---- discovery ----
 
     def entity_sets(self) -> list[str]:
-        """Entity-set names this web exposes, read rather than guessed."""
+        """Entity-set names this web exposes, read rather than guessed.
+
+        JSON first, then the AtomPub service document. Feeds and entities below
+        this level render as JSON on request, but the service *document* is
+        AtomPub by definition and whether a given WCF Data Services build will
+        emit JSON for it at all is version-dependent — SharePoint 2010's need
+        not, and the reported farm serves ``.atom`` here. Taking that for "the
+        feature is absent" writes off a farm that has been serving REST the whole
+        time, and sends the diagnosis after WCF Data Services rather than after
+        the content type we asked for.
+        """
         if self._entity_sets is None:
-            payload = self._get_json(self.endpoint + "/")
-            rows, _ = self._results(payload)
-            names = []
-            for row in rows:
-                name = row.get("name") if isinstance(row, dict) else None
-                if isinstance(name, str):
-                    names.append(name)
-            if not names and isinstance(payload["d"], dict):
-                names = [k for k in payload["d"] if k not in _CONTROL_KEYS]
+            try:
+                names = self._entity_sets_from_json()
+            except ODataNotJson as exc:
+                log.info(
+                    "odata.service_document.not_json",
+                    web=self.web_url,
+                    detail="service document is not JSON; reading it as AtomPub instead",
+                    content=str(exc).split(";", 1)[0],
+                )
+                names = self._entity_sets_from_atom(json_error=exc)
             self._entity_sets = names
             log.info("odata.service_document", web=self.web_url, entity_sets=len(names))
         return self._entity_sets
+
+    def _entity_sets_from_json(self) -> list[str]:
+        payload = self._get_json(self.endpoint + "/")
+        rows, _ = self._results(payload)
+        names = []
+        for row in rows:
+            name = row.get("name") if isinstance(row, dict) else None
+            if isinstance(name, str):
+                names.append(name)
+        if not names and isinstance(payload["d"], dict):
+            names = [k for k in payload["d"] if k not in _CONTROL_KEYS]
+        return names
+
+    def _entity_sets_from_atom(self, *, json_error: ODataNotJson) -> list[str]:
+        """Read ``<collection href="...">`` out of an AtomPub service document.
+
+        ``href`` rather than ``atom:title``: it is the URL segment, which is what
+        every later request is built from. The two usually agree, and where a
+        sanitiser has made them disagree the one that routes is the one we want.
+
+        Namespace-agnostic, because the document mixes the ``app`` and ``atom``
+        namespaces and older builds disagree about which is the default.
+        """
+        url = self.endpoint + "/"
+        response = self.transport.request(
+            "GET", url, headers={"Accept": "application/atomsvc+xml, application/xml, text/xml"}
+        )
+        names: list[str] = []
+        try:
+            root = etree.fromstring(response.content)
+        except etree.XMLSyntaxError:
+            root = None
+        if root is not None:
+            for collection in find_all(root, "collection"):
+                href = collection.get("href")
+                if href:
+                    names.append(href)
+
+        if not names:
+            raise ODataUnavailable(
+                f"{url} returned neither JSON nor an Atom service document.\n"
+                f"  as JSON: {json_error}\n"
+                f"  as Atom: {response.headers.get('Content-Type')}, no <collection> elements in "
+                f"{response.content[:200]!r}\n"
+                "  A 404 would mean the feature is not installed; this is something else "
+                "answering in its place."
+            )
+        return names
 
     def available(self) -> tuple[bool, str | None]:
         """Is ListData.svc usable on this web? Never raises."""

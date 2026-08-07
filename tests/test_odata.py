@@ -123,12 +123,61 @@ def test_a_404_means_the_feature_is_off_not_that_the_crawl_failed(
         ODataService(service.transport, WEB1).entity_sets()
 
 
-def test_html_body_with_a_200_is_also_typed(service: ODataService, farm: FakeFarm) -> None:
-    # Some proxies answer 200 with an error page rather than a status code.
+def test_html_body_with_a_200_is_not_mistaken_for_either_format(
+    service: ODataService, farm: FakeFarm
+) -> None:
+    # Some proxies answer 200 with an error page rather than a status code. It is
+    # neither JSON nor an Atom service document and must not pass as either.
     farm.odata_broken = "odata_not_available.html"
     farm.odata_broken_status = 200
-    with pytest.raises(ODataUnavailable, match="did not return JSON"):
+    with pytest.raises(ODataUnavailable, match="neither JSON nor an Atom service document"):
         ODataService(service.transport, WEB1).entity_sets()
+
+
+# --------------------------------------------------------------------------- #
+# the Atom service document
+#
+# Confirmed on the reported farm: ListData.svc serves .atom, not JSON. Feeds and
+# entities render as JSON on request, but the service *document* is AtomPub by
+# definition and whether a given WCF Data Services build will emit JSON for it is
+# version-dependent — SharePoint 2010's need not.
+# --------------------------------------------------------------------------- #
+
+
+def test_the_service_document_falls_back_to_atom(farm: FakeFarm, transport: Transport) -> None:
+    """A farm that only offers AtomPub here is still a farm with REST installed.
+
+    Reading a perfectly good Atom document as "the feature is absent" wrote off a
+    farm that had been serving REST the whole time, and sent the diagnosis after
+    WCF Data Services rather than after the content type we asked for.
+    """
+    farm.odata_service_document_json = False
+    service = ODataService(transport, WEB1)
+
+    assert service.entity_sets() == ["Servicefälle", "Kunden", "Dokumente", "MasterPageGallery"]
+    # And the umlaut matching still works off the Atom-sourced names.
+    assert service.entity_set_for("Servicefälle") == "Servicefälle"
+
+
+def test_the_atom_fallback_costs_one_extra_request_and_is_then_cached(
+    farm: FakeFarm, transport: Transport
+) -> None:
+    farm.odata_service_document_json = False
+    service = ODataService(transport, WEB1)
+    service.entity_sets()
+    service.entity_sets()
+
+    roots = [u for u in farm.odata_requests if u.rstrip("/").endswith("ListData.svc")]
+    assert len(roots) == 2, "one JSON attempt, one Atom fallback, then cached"
+
+
+def test_a_json_service_document_is_still_preferred(farm: FakeFarm, transport: Transport) -> None:
+    """No extra round trip on a farm that does render JSON here."""
+    service = ODataService(transport, WEB1)
+    service.entity_sets()
+
+    roots = [u for u in farm.odata_requests if u.rstrip("/").endswith("ListData.svc")]
+    assert len(roots) == 1
 
 
 # --------------------------------------------------------------------------- #

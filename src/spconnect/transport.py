@@ -398,6 +398,12 @@ def describe_auth_failure(response: requests.Response, *, auth_mode: str, userna
                     "requests and read 'sc-win32-status'. 1326 is a bad password; "
                     "2148074248 (SEC_E_INVALID_TOKEN) is cause 1 or 2; 2148074257 is DNS or "
                     "domain trust. One number decides where the next hour goes.",
+                    "  or yourself : authenticate the same account to a file share on the "
+                    "same domain — smbclient -L //<host> -U 'DOMAIN\\user'. That reaches the "
+                    "domain controller without IIS, HTTP, TLS or any proxy in the path. It "
+                    "works there but not here => cause 1 or 2, on the farm side. It fails "
+                    "there too => cause 3 or 4, and the account is where to look. No admin "
+                    "needed either way.",
                 ]
             )
         else:

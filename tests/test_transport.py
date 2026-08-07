@@ -147,6 +147,11 @@ def test_a_completed_handshake_that_is_refused_does_not_blame_the_password_alone
     # And the one thing that settles it, which is not on this machine.
     assert "sc-win32-status" in message
     assert "1326" in message
+    # Plus one that is, because waiting on an admin is not a diagnosis. A file
+    # share reaches the domain controller with no IIS, HTTP, TLS or proxy in the
+    # path, which splits a farm-side cause from an account-side one.
+    assert "smbclient" in message
+    assert "No admin needed" in message
 
 
 def test_which_scheme_we_answered_with_is_stated_when_two_were_offered() -> None:

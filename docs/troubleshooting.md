@@ -89,23 +89,43 @@ the handshake can never complete — while a bodyless GET to the same URL sails
 through.
 
 **What the connector does.** `SP_NTLM_PRIME_CONNECTION` (on by default) retries
-a 401'd POST once, on a connection an ordinary GET has just authenticated:
+a 401'd POST once, on a connection something contentless has just authenticated.
+It tries two things, in order, and stops at the first that negotiates: an **empty
+POST** to the same endpoint, then a **bodyless GET**.
 
 ```
 [info]    ntlm_prime        endpoint=…/Webs.asmx primed=True status=200
-[warning] ntlm_prime.retry  the POST was refused but a bodyless GET to the same
-                            endpoint was not; retrying the POST on the connection
-                            that GET authenticated
+[warning] ntlm_prime.retry  the POST was refused, but a contentless request to the
+                            same endpoint negotiated successfully; retrying the POST
+                            on the connection that authenticated
 ```
 
 Seeing `ntlm_prime.retry` in the log means the farm has this problem and the
 connector is working around it. That is worth reporting to the farm admin —
 enabling **Kerberos/Negotiate** fixes it properly — but it is not a blocker.
 
-The retry only happens when the GET **succeeds**. If the GET is refused too,
-the credential is genuinely being rejected and no second POST is attempted:
-spending an extra failed authentication against an account with a lockout
-policy is not a trade worth making.
+Two attempts is the ceiling. A 401 on the empty POST does **not** end it: a
+rejected credential and a handshake torn onto a fresh socket produce identical
+401s, and the bodyless GET is the only thing that separates them, because it
+gives IIS no body to close the connection over. If the GET is refused too, the
+credential really is being turned down, and no second POST is attempted:
+
+```
+[warning] ntlm_prime.refused  every priming attempt was refused, the bodyless GET
+                              included … reads as the credential being turned down
+                              rather than the handshake breaking
+```
+
+`ntlm_prime.anonymous` is a different finding: nothing we sent was challenged at
+all, so there is no authenticated connection to reuse and the endpoint is not
+asking for the credential the POST needs.
+
+One subtlety worth knowing when reading logs: once a handshake has completed,
+`requests-ntlm` sends every later request on that connection **without** an
+`Authorization` header, and IIS serves it anyway — NTLM authenticated the socket,
+not the request. Priming counts that as primed (`detail=served on a connection
+authenticated earlier in this session`) rather than mistaking it for anonymous
+access.
 
 ### `FAILED: SSLError`
 

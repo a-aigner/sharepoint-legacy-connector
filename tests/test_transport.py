@@ -705,6 +705,27 @@ class CompletedHandshake:
         return request
 
 
+class HandshakeThenPreauthenticatedConnection:
+    """A handshake, and then the bare requests that ride the connection it won.
+
+    ``requests-ntlm`` attaches ``Authorization`` only inside its 401 retry path.
+    So the exchange that negotiates carries a credential, and every later
+    request on that same connection carries **none** and is served anyway —
+    because NTLM authenticated the socket, not the request. That second shape is
+    what :class:`CompletedHandshake` cannot express and what priming has to
+    recognise: on the wire it is indistinguishable from anonymous access.
+    """
+
+    def __init__(self) -> None:
+        self.requests_seen = 0
+
+    def __call__(self, request):
+        self.requests_seen += 1
+        if self.requests_seen == 1:
+            request.headers["Authorization"] = "NTLM <negotiated>"
+        return request
+
+
 @pytest.fixture
 def ntlm_tp(tmp_path: Path) -> Transport:
     transport = Transport(
@@ -740,20 +761,69 @@ def test_priming_falls_back_to_a_get(rsps, ntlm_tp) -> None:
     assert [c.request.method for c in rsps.calls] == ["POST", "POST", "GET", "POST"]
 
 
-def test_a_genuinely_refused_credential_is_not_retried(rsps, ntlm_tp) -> None:
-    """A credential that is sent and still refused is rejected, not unprimed.
+def test_a_refused_contentless_post_still_tries_the_bodyless_get(rsps, ntlm_tp) -> None:
+    """A 401 on the contentless POST must not end the ladder.
 
-    Retrying there would spend a second failed authentication against an account
-    that may well have a lockout policy.
+    It is ambiguous: a rejected credential and a handshake torn onto a fresh
+    socket produce byte-identical 401s — challenge present, Type 3 already sent.
+    The bodyless GET is the request that separates them, so declining to send it
+    leaves exactly the farms this workaround exists for unreadable.
+    """
+    rsps.add(responses.POST, ENDPOINT, status=401)  # the real POST: body kills the handshake
+    rsps.add(responses.POST, ENDPOINT, status=401)  # contentless POST: refused, ambiguously
+    rsps.add(responses.GET, ENDPOINT, status=200, body="<html/>")  # the shape that works
+    rsps.add(responses.POST, ENDPOINT, status=200, body="<ok/>")
+
+    assert ntlm_tp.post_soap(ENDPOINT, b"<x/>", "op") == b"<ok/>"
+    assert [c.request.method for c in rsps.calls] == ["POST", "POST", "GET", "POST"]
+
+
+def test_a_genuinely_refused_credential_is_not_retried(rsps, ntlm_tp) -> None:
+    """A credential refused for a bodyless GET too is rejected, not unprimed.
+
+    A GET carries no body for IIS to tear the connection down over, so a refusal
+    there is the account being turned down. Two priming attempts is the ceiling:
+    no third attempt, and no second real POST, against what may well be an
+    account with a lockout policy.
     """
     rsps.add(responses.POST, ENDPOINT, status=401)
     rsps.add(responses.POST, ENDPOINT, status=401)
+    rsps.add(responses.GET, ENDPOINT, status=401)
 
     with pytest.raises(AuthenticationError):
         ntlm_tp.post_soap(ENDPOINT, b"<x/>", "op")
 
-    # One priming attempt, no fallback, and no second real POST.
-    assert [c.request.method for c in rsps.calls] == ["POST", "POST"]
+    assert [c.request.method for c in rsps.calls] == ["POST", "POST", "GET"]
+
+
+def test_priming_recognises_a_connection_already_authenticated_earlier(rsps, tmp_path: Path) -> None:
+    """A bare 200 on a session that has already negotiated *is* a primed connection.
+
+    This is the shape the real handler produces and the shape priming used to
+    throw away: no ``Authorization`` header, no challenge, served anyway. Read as
+    anonymous access it reports "nothing we sent was challenged" and gives up,
+    which is how a farm that had just handed us a working connection still came
+    out unreadable.
+    """
+    tp = Transport(
+        make_settings(tmp_path, auth_mode="ntlm", username="CONTOSO\\p", password="pw", max_retries=1)
+    )
+    tp.session.auth = HandshakeThenPreauthenticatedConnection()
+
+    # A first exchange negotiates, exactly as step 3 of `probe` does.
+    rsps.add(responses.HEAD, WEB1, status=200, headers={"MicrosoftSharePointTeamServices": "14.0"})
+    tp.probe_version()
+    assert tp.credential_accepted is True
+
+    rsps.add(responses.POST, ENDPOINT, status=401)
+    rsps.add(responses.POST, ENDPOINT, status=200, body="<primed/>")
+    rsps.add(responses.POST, ENDPOINT, status=200, body="<ok/>")
+
+    assert tp.post_soap(ENDPOINT, b"<x/>", "op") == b"<ok/>"
+
+    assert [c.request.method for c in rsps.calls] == ["HEAD", "POST", "POST", "POST"]
+    # The priming POST really did go out bare — the point is that it counted anyway.
+    assert "Authorization" not in rsps.calls[2].request.headers
 
 
 def test_priming_is_attempted_only_once(rsps, ntlm_tp) -> None:
@@ -865,8 +935,10 @@ def test_the_envelope_survives_every_retry_path(rsps, tmp_path: Path) -> None:
 def test_a_farm_that_always_401s_terminates(rsps, ntlm_tp) -> None:
     """No loop: the handshake retry is one-shot, whatever the server does."""
     rsps.add(responses.POST, ENDPOINT, status=401)  # every request, forever
+    rsps.add(responses.GET, ENDPOINT, status=401)
 
     with pytest.raises(AuthenticationError):
         ntlm_tp.post_soap(ENDPOINT, b"<x/>", "op")
 
-    assert len(rsps.calls) == 2  # the call, one priming attempt, then done
+    # The call, then the two priming attempts, then done — no second real POST.
+    assert [c.request.method for c in rsps.calls] == ["POST", "POST", "GET"]

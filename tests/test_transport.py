@@ -122,6 +122,12 @@ def a_completed_handshake_401() -> requests.Response:
     return response
 
 
+def a_completed_handshake_401_offering(challenge: str) -> requests.Response:
+    response = a_401(challenge=challenge)
+    response.history = [a_401(challenge=challenge), a_401(challenge=challenge)]
+    return response
+
+
 def test_a_completed_handshake_that_is_refused_does_not_blame_the_password_alone() -> None:
     """Microsoft's own escalation guidance lists several causes; this used to name one.
 
@@ -141,6 +147,34 @@ def test_a_completed_handshake_that_is_refused_does_not_blame_the_password_alone
     # And the one thing that settles it, which is not on this machine.
     assert "sc-win32-status" in message
     assert "1326" in message
+
+
+def test_which_scheme_we_answered_with_is_stated_when_two_were_offered() -> None:
+    """requests-ntlm picks NTLM whenever it is offered, whatever else is.
+
+    So "re-challenges with Negotiate, NTLM" leaves an operator unable to tell which
+    of the two we replied with — and Kerberos, which sidesteps every NTLM-specific
+    cause, is silently never attempted in this mode.
+    """
+    message = describe_auth_failure(
+        a_completed_handshake_401_offering("Negotiate, NTLM"),
+        auth_mode="ntlm",
+        username="CONTOSO\\p",
+    )
+
+    assert "we answered : NTLM" in message
+    assert "Kerberos is untried here" in message
+    assert "kinit" in message
+
+
+def test_no_scheme_note_when_only_ntlm_was_on_offer() -> None:
+    """Nothing was passed over, so there is nothing to disclose."""
+    message = describe_auth_failure(
+        a_completed_handshake_401_offering("NTLM"), auth_mode="ntlm", username="CONTOSO\\p"
+    )
+
+    assert "we answered" not in message
+    assert "kinit" not in message
 
 
 def test_a_handshake_that_never_completed_still_points_at_the_settings() -> None:

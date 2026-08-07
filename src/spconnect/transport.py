@@ -355,6 +355,18 @@ def describe_auth_failure(response: requests.Response, *, auth_mode: str, userna
             return "\n".join(lines)
 
         lines.append(f"  server says : rejected it, and re-challenges with {', '.join(schemes)}")
+        if auth_mode == "ntlm" and {"ntlm", "negotiate"} <= offered:
+            # requests-ntlm picks NTLM whenever it is on offer, whatever else is, so
+            # Negotiate is never attempted in this mode. Worth saying out loud:
+            # every NTLM-specific cause below is moot under Kerberos, and an
+            # operator reading "re-challenges with Negotiate, NTLM" has no way to
+            # tell which of the two we actually answered with.
+            lines.append(
+                "  we answered : NTLM. SP_AUTH_MODE=ntlm always does, even where Negotiate "
+                "is offered too, so Kerberos is untried here — and it sidesteps every "
+                "NTLM-specific cause below. pip install 'spconnect[kerberos]', kinit as the "
+                "service account, then SP_AUTH_MODE=integrated."
+            )
         if auth_mode == "ntlm" and username and "\\" not in username and "@" not in username:
             lines.append(
                 f"  username    : '{username}' has no domain part. NTLM usually needs "

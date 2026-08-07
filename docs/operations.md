@@ -194,7 +194,8 @@ Interrupt-safe. Resume with `spconnect crawl --resume`.
 | Command | What it does |
 |---|---|
 | `spconnect probe` | Eight-step connectivity and capability check. Nonzero exit on failure. |
-| `spconnect probe-rest` | The same farm over REST instead of SOAP — isolates a broken POST from a broken account |
+| `spconnect probe-rest [-e COLLECTION]` | The same farm over REST instead of SOAP — isolates a broken POST from a broken account |
+| `spconnect explore [--json]` | Every REST collection on this web and how many entries each holds. No SOAP, so it works where the POST is refused |
 | `spconnect permissions [--json] [--no-probe-items]` | What this credential can actually read, web by web and list by list |
 | `spconnect discover` | Webs + lists inventory. No items. |
 | `spconnect schema` | `GetList` per in-scope list; writes `list.json`, rebuilds the graph |

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -471,6 +472,143 @@ def probe(ctx: typer.Context) -> None:
 #: service document names every list on the web, and a farm of this vintage should
 #: not be asked to serve fifty probes to settle one question.
 REST_PROBE_ATTEMPTS = 8
+
+
+@dataclass
+class CollectionCount:
+    """One collection's size, or why it could not be taken.
+
+    ``entries=None`` and ``entries=0`` are deliberately different states. An
+    empty list and an unreadable one call for opposite responses, and rendering
+    both as ``0`` would hide every failure in a column of plausible numbers.
+    """
+
+    name: str
+    entries: int | None = None
+    error: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"collection": self.name, "entries": self.entries, "error": self.error}
+
+
+def _count_collections(service: ODataService, names: list[str]) -> list[CollectionCount]:
+    """Count every collection, surviving the ones that cannot be counted.
+
+    One unreadable collection must not cost the inventory — that is the whole
+    point of an explore command. A refused *credential* does stop it, though:
+    every remaining collection would fail for the same reason, and a column of
+    forty identical 401s is noise rather than a finding.
+    """
+    counted: list[CollectionCount] = []
+    for name in names:
+        try:
+            counted.append(CollectionCount(name, entries=service.count(name)))
+        except AuthenticationError:
+            raise
+        except Exception as exc:
+            counted.append(CollectionCount(name, error=f"{type(exc).__name__}: {str(exc).splitlines()[0]}"))
+    # Biggest first, and the uncountable last where they read as a list of
+    # problems rather than as the smallest lists on the farm.
+    counted.sort(key=lambda c: (c.entries is None, -(c.entries or 0), c.name.casefold()))
+    return counted
+
+
+@app.command()
+def explore(
+    ctx: typer.Context,
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Emit machine-readable output instead of a table.")
+    ] = False,
+) -> None:
+    """Every REST collection on this web, and how many entries each holds.
+
+    Entirely over ``ListData.svc``: no SOAP anywhere, so this still works on a
+    farm whose SOAP POSTs are refused. Read-only, and one request per collection.
+
+    Covers the web named by ``SP_BASE_URL`` and no other. Walking subwebs needs
+    ``Webs.asmx``, which is a SOAP POST — a farm that refuses those cannot be
+    enumerated, and letting one web's collections pass for the farm's would be
+    worse than not reporting them.
+    """
+    context = _ctx(ctx)
+    settings = context.settings
+    service = ODataService(context.transport, settings.base_url)
+
+    try:
+        ensure_client(context)
+        names = service.entity_sets()
+        counted = _count_collections(service, names)
+    except AuthenticationError as exc:
+        report_auth_failure(context, settings, None, exc)
+        report_traffic(context)
+        context.close()
+        raise typer.Exit(2) from exc
+    except RedirectRefused as exc:
+        echo(f"\nFAILED: {exc}")
+        report_refused_redirect(exc)
+        context.close()
+        raise typer.Exit(2) from exc
+    except Exception as exc:
+        echo(f"\nFAILED: {type(exc).__name__}: {exc}")
+        echo("\nNothing was counted. `spconnect probe-rest` says whether REST answers at all.")
+        report_traffic(context)
+        context.close()
+        raise typer.Exit(1) from exc
+
+    try:
+        if as_json:
+            echo(
+                _dump_json(
+                    {
+                        "web": settings.base_url,
+                        "representation": service.representation,
+                        "collections": [c.as_dict() for c in counted],
+                    }
+                )
+            )
+        else:
+            _render_exploration(settings, service, counted)
+    finally:
+        if not as_json:
+            report_traffic(context)
+        context.close()
+
+    raise typer.Exit(0 if any(c.entries is not None for c in counted) else 1)
+
+
+def _render_exploration(settings: Settings, service: ODataService, counted: list[CollectionCount]) -> None:
+    echo(f"spconnect explore -> {settings.base_url}")
+    echo("─" * min(len(settings.base_url) + 20, 78))
+    echo(f"  ListData.svc served as {service.representation}, {len(counted)} collection(s)")
+    echo("  This web only — enumerating subwebs would need SOAP.")
+    echo("")
+
+    width = max((len(c.name) for c in counted), default=10)
+    echo(f"  {'entries':>10}  collection")
+    echo(f"  {'-' * 10}  {'-' * width}")
+    for entry in counted:
+        # An em dash, not a zero: the difference between empty and unreadable is
+        # the most important thing this table has to say.
+        size = f"{entry.entries:,}" if entry.entries is not None else "—"
+        line = f"  {size:>10}  {entry.name:<{width}}"
+        if entry.entries is not None and entry.entries > LIST_VIEW_THRESHOLD:
+            line += f"  [over the {LIST_VIEW_THRESHOLD:,}-item threshold]"
+        elif entry.error:
+            line += f"  {entry.error}"
+        echo(line.rstrip())
+
+    counted_ok = [c for c in counted if c.entries is not None]
+    total = sum(c.entries or 0 for c in counted_ok)
+    failed = len(counted) - len(counted_ok)
+    echo("")
+    summary = f"{len(counted_ok)} collection(s) counted, {total:,} entries in total"
+    if failed:
+        summary += f"; {failed} could not be counted"
+    echo(summary)
+    if oversized := [c.name for c in counted_ok if (c.entries or 0) > LIST_VIEW_THRESHOLD]:
+        echo("")
+        echo(f"Over the {LIST_VIEW_THRESHOLD:,}-item list view threshold: {', '.join(oversized)}")
+        echo(THRESHOLD_ADVICE)
 
 
 def _first_readable_collection(
@@ -1164,7 +1302,7 @@ def _print_threshold_warning(report: RunReport) -> None:
         echo("ERROR: these lists were throttled by the SharePoint 2010 list view threshold:")
         for entry in report.throttled_lists[:20]:
             echo(f"  - {entry}")
-        echo(THRESHOLD_ADVICE.format(threshold=LIST_VIEW_THRESHOLD))
+        echo(THRESHOLD_ADVICE)
     elif report.large_lists:
         echo("")
         echo(f"NOTE: {len(report.large_lists)} list(s) hold more than {LIST_VIEW_THRESHOLD:,} items:")

@@ -54,9 +54,13 @@ MAX_SYNC_PAGES = 500
 #: queries over big document libraries are the ones that still trip.
 LIST_VIEW_THRESHOLD = 5000
 
+#: Interpolated here rather than left as a ``{threshold}`` placeholder for callers
+#: to fill in. The threshold is a constant, so the template bought nothing and cost
+#: something: one of the two call sites forgot the ``.format()`` and printed the
+#: placeholder to an operator.
 THRESHOLD_ADVICE = (
-    "SharePoint 2010 throttles list queries at {threshold} items. spconnect pages on the "
-    "indexed ID column, which normally avoids this. If a list still fails, ask the farm "
+    f"SharePoint 2010 throttles list queries at {LIST_VIEW_THRESHOLD:,} items. spconnect pages "
+    "on the indexed ID column, which normally avoids this. If a list still fails, ask the farm "
     "admin to raise the threshold, to add an index, or to schedule the crawl inside the "
     "daily unthrottled window."
 )

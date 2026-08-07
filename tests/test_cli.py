@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -10,7 +11,7 @@ import pytest
 import responses
 from typer.testing import CliRunner
 
-from conftest import CASES, WEB1, FakeFarm
+from conftest import CASES, WEB1, FakeFarm, fixture
 from spconnect.cli import REST_PROBE_ATTEMPTS, _first_readable_collection, app
 from spconnect.cli import run as cli_run
 from spconnect.services.odata import ODataPage, ODataUnavailable
@@ -29,6 +30,10 @@ def env_file(tmp_path: Path) -> Path:
         "SP_PASSWORD=supersecret\n"
         "SP_ALLOW_LEGACY_TLS=false\n"
         "SP_REQUESTS_PER_SECOND=10000\n"
+        # Without these, one retryable status costs 2+4+8+16 seconds of real
+        # backoff and a single test can stall the whole suite.
+        "SP_MAX_RETRIES=2\n"
+        "SP_BACKOFF_BASE_SECONDS=0.001\n"
         "SP_PAGE_SIZE=2\n"
         "SP_DOWNLOAD_FILES=false\n"
         f"SP_LANDING_DIR={tmp_path / 'landing'}\n"
@@ -584,6 +589,131 @@ def test_probe_rest_names_the_representation_it_was_served(env_file: Path, farm:
 
     assert result.exit_code == 0
     assert "served as atom" in result.stdout
+
+
+# --------------------------------------------------------------------------- #
+# explore
+# --------------------------------------------------------------------------- #
+
+
+def test_explore_counts_every_collection(env_file: Path, farm: FakeFarm) -> None:
+    result = run(env_file, "explore")
+
+    assert result.exit_code == 0
+    assert "Servicefälle" in result.stdout
+    assert "Kunden" in result.stdout
+    assert "MasterPageGallery" in result.stdout
+    # Biggest first, so the interesting lists are at the top of a long table.
+    order = [result.stdout.index(n) for n in ("Servicefälle", "Kunden", "Dokumente")]
+    assert order == sorted(order)
+    assert "6 entries in total" in result.stdout
+
+
+@pytest.mark.parametrize("fmt", ["json", "atom"])
+def test_explore_works_in_either_representation(env_file: Path, farm: FakeFarm, fmt: str) -> None:
+    farm.odata_format = fmt
+
+    result = run(env_file, "explore")
+
+    assert result.exit_code == 0
+    assert f"served as {fmt}" in result.stdout
+    assert "6 entries in total" in result.stdout
+
+
+def test_explore_falls_back_when_the_farm_has_no_dollar_count(env_file: Path, farm: FakeFarm) -> None:
+    """Some builds — and some proxies in front of them — do not implement $count.
+
+    $inlinecount=allpages asks for the same number inside an empty page, which
+    every OData v2 service can render. Without this, a farm that simply lacks one
+    path segment would report every collection as uncountable.
+    """
+    farm.odata_supports_count = False
+
+    result = run(env_file, "explore")
+
+    assert result.exit_code == 0
+    assert "6 entries in total" in result.stdout
+
+
+def test_explore_never_prints_zero_for_a_count_it_could_not_take(env_file: Path, farm: FakeFarm) -> None:
+    """The distinction the whole table exists to preserve.
+
+    An empty list and an unreadable one call for opposite responses. Rendering
+    both as 0 would hide every failure in a column of plausible numbers — the
+    same false-green shape as reading an anonymous 200 as a working credential.
+    """
+
+    def only_the_service_document(request):
+        if request.url.rstrip("/").endswith("ListData.svc"):
+            return 200, {"Content-Type": "application/json"}, fixture("odata_service_document.json")
+        # 404, not 500: a missing collection is not retryable, and a retryable
+        # status here would spend the backoff ladder on every one of them.
+        return 404, {"Content-Type": "text/plain"}, "not found"
+
+    farm.mock.reset()
+    farm.mock.add_callback(
+        responses.GET,
+        re.compile(re.escape(f"{WEB1}/_vti_bin/ListData.svc") + r".*"),
+        callback=only_the_service_document,
+    )
+
+    result = run(env_file, "explore")
+
+    assert result.exit_code == 1, "nothing countable is a failure, not an empty farm"
+    assert "—" in result.stdout, "uncountable renders as an em dash, never as 0"
+    assert "4 could not be counted" in result.stdout
+
+
+def test_explore_json_is_machine_readable(env_file: Path, farm: FakeFarm) -> None:
+    result = run(env_file, "explore", "--json")
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["web"] == WEB1
+    assert payload["representation"] in ("json", "atom")
+    counts = {c["collection"]: c["entries"] for c in payload["collections"]}
+    assert counts["Servicefälle"] == 3
+    assert counts["MasterPageGallery"] == 0
+    # None, not 0, is how "could not be counted" survives into a machine reader.
+    assert all(c["entries"] is not None or c["error"] for c in payload["collections"])
+
+
+def test_explore_flags_lists_over_the_view_threshold(env_file: Path, farm: FakeFarm) -> None:
+    farm.odata_counts["Servicefälle"] = 12_904
+
+    result = run(env_file, "explore")
+
+    assert result.exit_code == 0
+    assert "5,000-item" in result.stdout
+    assert "12,904" in result.stdout
+    # The advice used to be a {threshold} template that one call site forgot to
+    # fill in, printing the placeholder to an operator instead of a number.
+    assert "{threshold}" not in result.stdout
+    assert "throttles list queries at 5,000 items" in result.stdout
+
+
+def test_explore_reports_a_refused_credential_rather_than_forty_of_them(
+    env_file: Path, farm: FakeFarm
+) -> None:
+    """One 401 is a finding; forty identical ones are noise."""
+
+    def refuse(request):
+        if request.url.rstrip("/").endswith("ListData.svc"):
+            return 200, {"Content-Type": "application/json"}, fixture("odata_service_document.json")
+        return 401, {"WWW-Authenticate": "NTLM"}, ""
+
+    farm.mock.reset()
+    farm.mock.add_callback(
+        responses.GET,
+        re.compile(re.escape(f"{WEB1}/_vti_bin/ListData.svc") + r".*"),
+        callback=refuse,
+    )
+    farm.mock.add(responses.GET, WEB1, status=401, headers={"WWW-Authenticate": "NTLM"})
+
+    result = run(env_file, "explore")
+
+    assert result.exit_code == 2
+    assert "AUTH FAILED" in result.stdout
 
 
 def test_probe_rest_succeeds_when_both_backends_work(env_file: Path, farm: FakeFarm) -> None:

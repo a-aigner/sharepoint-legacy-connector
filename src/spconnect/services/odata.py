@@ -460,6 +460,54 @@ class ODataService:
         log.warning("odata.no_entity_set", list=list_title, available=len(candidates))
         return None
 
+    # ---- counting ----
+
+    def count(self, entity_set: str) -> int:
+        """How many entities this collection holds.
+
+        ``$count`` first: a path segment that answers with a bare integer in
+        ``text/plain``, so it costs one request and needs no parsing at all.
+        Where a build or a proxy in front of it does not implement that,
+        ``$inlinecount=allpages`` asks for the same number inside an otherwise
+        empty page, which every OData v2 service can render in either
+        representation.
+
+        **Raises rather than returning a sentinel.** A count that could not be
+        taken must never be indistinguishable from a count of zero — an empty
+        list and an unreadable one call for opposite responses, and a caller
+        given ``0`` for both has no way to tell which it got.
+        """
+        url = f"{self.endpoint}/{entity_set}/$count"
+        try:
+            response = self._get(url, accept="text/plain")
+            text = response.content.decode("utf-8", "replace").strip()
+            if text.isdigit():
+                return int(text)
+            # A service without $count can answer 200 with a whole page instead
+            # of a number, so the digits are the confirmation and the status is
+            # not. Falling through to the query option is the right move either
+            # way, and it is one more request rather than a wrong answer.
+            raise ODataError(f"{url} answered without a count: {text[:100]!r}")
+        except ODataError as exc:
+            log.debug("odata.count.fallback", entity_set=entity_set, detail=str(exc).splitlines()[0])
+            return self._count_via_inlinecount(entity_set)
+
+    def _count_via_inlinecount(self, entity_set: str) -> int:
+        url = f"{self.endpoint}/{entity_set}?$top=0&$inlinecount=allpages"
+        response = self._get(url, accept=_ACCEPT_ENTITIES)
+        raw: Any = None
+        if self._is_json(response):
+            body = self._parse_json(url, response)["d"]
+            if isinstance(body, dict):
+                raw = body.get("__count")
+        else:
+            found = find_all(self._parse_atom(url, response), "count")
+            raw = found[0].text if found else None
+        text = str(raw).strip() if raw is not None else ""
+        if not text.isdigit():
+            raise ODataError(f"{url} returned no usable $inlinecount (got {raw!r})")
+        return int(text)
+
     # ---- items ----
 
     def get_items(

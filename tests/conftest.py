@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 from typing import Any, ClassVar
+from urllib.parse import unquote
 
 import pytest
 import responses
@@ -116,7 +117,15 @@ class FakeFarm:
         #: and the feeds beneath it; OData v2 requires Atom and makes JSON
         #: optional, so both have to work.
         self.odata_format: str = "json"
+        #: Does the farm implement the ``$count`` path segment? Some builds and
+        #: some proxies in front of them do not, which is why there is a fallback.
+        self.odata_supports_count: bool = True
+        #: Entries per collection, for ``$count`` and ``$inlinecount``.
+        self.odata_counts: dict[str, int] = {"Servicefälle": 3, "Kunden": 2, "Dokumente": 1}
         self._install()
+
+    def entry_count(self, collection: str) -> int:
+        return self.odata_counts.get(collection, 0)
 
     # ---- routing tables ----
 
@@ -191,6 +200,30 @@ class FakeFarm:
         query = path.split("?", 1)[1] if "?" in path else ""
         entity = path.split("?", 1)[0].strip("/")
         atom = self.odata_format == "atom"
+
+        if entity.endswith("/$count"):
+            if not self.odata_supports_count:
+                return 404, {"Content-Type": "text/html"}, "<html>no such resource</html>"
+            # Percent-decoded, because an umlaut in a list title reaches the wire
+            # as Servicef%C3%A4lle and a farm keyed on the readable name would
+            # silently report every German list as empty.
+            name = unquote(entity[: -len("/$count")])
+            return 200, {"Content-Type": "text/plain;charset=utf-8"}, str(self.entry_count(name))
+        if "inlinecount=allpages" in query:
+            total = self.entry_count(unquote(entity))
+            if atom:
+                body = (
+                    '<?xml version="1.0" encoding="utf-8"?>'
+                    '<feed xmlns="http://www.w3.org/2005/Atom" '
+                    'xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">'
+                    f"<m:count>{total}</m:count></feed>"
+                )
+                return 200, {"Content-Type": "application/atom+xml;type=feed"}, body
+            return (
+                200,
+                {"Content-Type": "application/json"},
+                f'{{"d": {{"results": [], "__count": "{total}"}}}}',
+            )
 
         if not entity:
             if atom:

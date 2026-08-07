@@ -1308,7 +1308,59 @@ class Transport:
             return EndpointCheck(f"{response.status_code} -> {location}", reached, authenticated)
         return EndpointCheck(str(response.status_code), reached, authenticated)
 
-    def diagnose_endpoint_auth(self, endpoint: str) -> list[str]:
+    def endpoint_scheme_notes(self, endpoint: str, root_schemes: list[str] | None = None) -> list[str]:
+        """What the *endpoint* offers an unauthenticated request, and what follows.
+
+        IIS authentication is configured per virtual directory, so ``_vti_bin`` can
+        offer something different from the site root. Asking the root and calling
+        it settled is how a farm with Kerberos-only web services gets diagnosed as
+        a bad password: NTLM is never offered, nothing is ever sent, and the server
+        logs a request with no credentials.
+
+        One unauthenticated request. Also the only place that can say whether
+        Kerberos is available here — which matters more than it looks, because
+        Negotiate sidesteps NTLM's connection binding entirely and is reachable
+        from Linux with a ticket and no password.
+        """
+        offered = self.probe_auth_schemes(endpoint)
+        if offered.error:
+            return [f"  {endpoint} could not be asked what it offers: {offered.error}"]
+
+        names = {s.lower() for s in offered.schemes}
+        lines = [
+            f"  {endpoint} offers: "
+            + (", ".join(offered.schemes) if offered.schemes else "no challenge at all")
+        ]
+
+        if root_schemes is not None and names != {s.lower() for s in root_schemes}:
+            lines.append(
+                "  => _vti_bin is configured differently from the site root "
+                f"({', '.join(root_schemes) or 'no challenge'}). IIS authentication is "
+                "per virtual directory, so this is the farm's own doing and a SharePoint "
+                "admin has to change it."
+            )
+
+        if "negotiate" in names:
+            lines.append(
+                "  Negotiate is offered here, so Kerberos can sidestep the NTLM handshake "
+                "entirely — and it needs no password. From Linux: pip install "
+                "'spconnect[kerberos]', kinit as the service account, then "
+                "SP_AUTH_MODE=integrated."
+            )
+        elif "ntlm" in names:
+            lines.append(
+                "  NTLM only, no Negotiate — so there is no Kerberos escape from this "
+                "endpoint however the client is configured, and SP_AUTH_MODE=integrated "
+                "cannot help from a machine that is not domain-joined."
+            )
+        elif not offered.schemes:
+            lines.append(
+                "  Nothing is being asked for, so this endpoint is served anonymously. "
+                "A credential cannot be rejected by a request that never carries one."
+            )
+        return lines
+
+    def diagnose_endpoint_auth(self, endpoint: str, root_schemes: list[str] | None = None) -> list[str]:
         """Separate "this credential is refused" from "this *request* is refused".
 
         A 401 on a SOAP POST has four very different causes that look identical
@@ -1395,6 +1447,9 @@ class Transport:
                 "  => The account cannot read this web at all. This is a SharePoint "
                 "permissions question: grant it Read on the root web, then retry."
             )
+
+        lines.append("")
+        lines.extend(self.endpoint_scheme_notes(endpoint, root_schemes))
         return lines
 
     def check_base_url(self, url: str | None = None) -> None:

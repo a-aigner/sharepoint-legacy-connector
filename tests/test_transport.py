@@ -681,6 +681,47 @@ def test_the_differential_does_not_count_a_denial_redirect_as_reaching_the_site(
     assert "cannot read this web at all" in lines
 
 
+def test_a_kerberos_only_endpoint_is_named_rather_than_blamed_on_the_password(rsps, tmp_path: Path) -> None:
+    """IIS auth is per virtual directory, so the site root does not settle _vti_bin.
+
+    A farm whose web services are Negotiate-only never offers NTLM there, so
+    nothing is ever sent and the server logs a request with no credentials. Asking
+    only the root and calling it settled is how that becomes "wrong password".
+    """
+    tp = Transport(make_settings(tmp_path, auth_mode="ntlm", username="CONTOSO\\p", password="pw"))
+    rsps.add(responses.GET, ENDPOINT, status=401, headers={"WWW-Authenticate": "Negotiate"})
+
+    lines = "\n".join(tp.endpoint_scheme_notes(ENDPOINT, root_schemes=["NTLM", "Negotiate"]))
+
+    assert "offers: Negotiate" in lines
+    assert "configured differently from the site root" in lines
+    # And the way out, which happens to be the only one that works from Linux.
+    assert "kinit" in lines
+    assert "SP_AUTH_MODE=integrated" in lines
+
+
+def test_an_ntlm_only_endpoint_says_kerberos_is_not_an_escape(rsps, tmp_path: Path) -> None:
+    """The reported farm's shape. Advising Kerberos here would waste an admin's day."""
+    tp = Transport(make_settings(tmp_path, auth_mode="ntlm", username="CONTOSO\\p", password="pw"))
+    rsps.add(responses.GET, ENDPOINT, status=401, headers={"WWW-Authenticate": "NTLM"})
+
+    lines = "\n".join(tp.endpoint_scheme_notes(ENDPOINT, root_schemes=["NTLM"]))
+
+    assert "NTLM only, no Negotiate" in lines
+    assert "configured differently" not in lines
+    assert "kinit" not in lines
+
+
+def test_an_anonymous_endpoint_says_no_credential_is_being_asked_for(rsps, tmp_path: Path) -> None:
+    tp = Transport(make_settings(tmp_path, auth_mode="ntlm", username="CONTOSO\\p", password="pw"))
+    rsps.add(responses.GET, ENDPOINT, status=200, body="<html/>")
+
+    lines = "\n".join(tp.endpoint_scheme_notes(ENDPOINT, root_schemes=[]))
+
+    assert "no challenge at all" in lines
+    assert "served anonymously" in lines
+
+
 def test_the_differential_refuses_to_read_anonymous_200s_as_a_working_credential(
     rsps, tmp_path: Path
 ) -> None:
@@ -721,7 +762,9 @@ def test_the_differential_still_blames_the_post_when_the_gets_did_authenticate(r
 
     assert "The credential is accepted for both" in lines
     assert "Kerberos" in lines
-    assert "anonymous" not in lines
+    assert "INCONCLUSIVE" not in lines
+    # The GET rows themselves must not be annotated as having sent no credential.
+    assert "(anonymous — no credential was sent)" not in lines
 
 
 def test_a_refused_get_does_not_count_as_proof_the_credential_works(rsps, tmp_path: Path) -> None:

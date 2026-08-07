@@ -265,7 +265,8 @@ def report_auth_failure(context: Context, settings: Settings, auth: AuthProbe | 
     echo("")
 
     if auth is None or auth.suggested_mode in (None, settings.auth_mode):
-        for line in context.transport.diagnose_endpoint_auth(f"{settings.base_url}/_vti_bin/Webs.asmx"):
+        endpoint = f"{settings.base_url}/_vti_bin/Webs.asmx"
+        for line in context.transport.diagnose_endpoint_auth(endpoint, auth.schemes if auth else None):
             echo(line)
     else:
         # Every request would 401 for the same trivial reason, and the

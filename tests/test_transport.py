@@ -691,11 +691,27 @@ def test_the_differential_does_not_count_a_denial_redirect_as_reaching_the_site(
 # --------------------------------------------------------------------------- #
 
 
+class CompletedHandshake:
+    """Stands in for a finished NTLM negotiation: the request carries a credential.
+
+    The real handshake cannot run against `responses` — requests-ntlm reaches
+    for the TLS socket to build a channel binding token and there is no socket.
+    What matters to priming is only whether the winning request was
+    authenticated, which this reproduces exactly.
+    """
+
+    def __call__(self, request):
+        request.headers["Authorization"] = "NTLM <negotiated>"
+        return request
+
+
 @pytest.fixture
 def ntlm_tp(tmp_path: Path) -> Transport:
-    return Transport(
+    transport = Transport(
         make_settings(tmp_path, auth_mode="ntlm", username="CONTOSO\\p", password="pw", max_retries=1)
     )
+    transport.session.auth = CompletedHandshake()
+    return transport
 
 
 def test_a_post_refused_where_a_get_succeeds_is_retried_and_works(rsps, ntlm_tp: Transport) -> None:
@@ -734,6 +750,25 @@ def test_priming_is_attempted_only_once(rsps, ntlm_tp: Transport) -> None:
         ntlm_tp.post_soap(ENDPOINT, b"<x/>", "op")
 
     assert [c.request.method for c in rsps.calls] == ["POST", "GET", "POST"]
+
+
+def test_a_get_served_anonymously_does_not_count_as_priming(rsps, tmp_path: Path) -> None:
+    """A 200 is not proof of a handshake.
+
+    Where SharePoint permits anonymous reads the GET succeeds without ever being
+    challenged, so the connection is left exactly as unauthenticated as it was.
+    Retrying the POST on it would change nothing and hide the real problem —
+    that the server is not asking for a credential at all.
+    """
+    tp = Transport(make_settings(tmp_path, auth_mode="ntlm", username="u", password="p"))
+    tp.session.auth = None  # nothing attaches a credential: the GET is anonymous
+    rsps.add(responses.POST, ENDPOINT, status=401)
+    rsps.add(responses.GET, ENDPOINT, status=200, body="<html>anyone may read this</html>")
+
+    with pytest.raises(AuthenticationError):
+        tp.post_soap(ENDPOINT, b"<x/>", "op")
+
+    assert [c.request.method for c in rsps.calls] == ["POST", "GET"]
 
 
 def test_priming_can_be_switched_off(rsps, tmp_path: Path) -> None:

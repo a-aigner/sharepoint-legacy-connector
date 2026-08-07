@@ -965,9 +965,33 @@ class Transport:
         except (requests.ConnectionError, requests.Timeout) as exc:
             log.debug("ntlm_prime.failed", endpoint=endpoint, error=str(exc))
             return False
-        ok = response.status_code < 400
-        log.info("ntlm_prime", endpoint=endpoint, status=response.status_code, primed=ok)
-        return ok
+
+        if response.status_code >= 400:
+            log.info("ntlm_prime", endpoint=endpoint, status=response.status_code, primed=False)
+            return False
+
+        # A 200 is not proof of a handshake. Where SharePoint permits anonymous
+        # reads, the GET succeeds without ever being challenged and without
+        # sending a credential — leaving the connection exactly as
+        # unauthenticated as it was, so retrying the POST on it would change
+        # nothing and merely obscure the real problem.
+        request_headers = getattr(response.request, "headers", {}) or {}
+        if "authorization" not in {k.lower() for k in request_headers}:
+            log.warning(
+                "ntlm_prime.anonymous",
+                endpoint=endpoint,
+                status=response.status_code,
+                detail=(
+                    "the GET succeeded WITHOUT authenticating — this endpoint serves it "
+                    "anonymously, so it cannot authenticate the connection and priming "
+                    "would achieve nothing. The POST needs a credential the server is "
+                    "never asking for."
+                ),
+            )
+            return False
+
+        log.info("ntlm_prime", endpoint=endpoint, status=response.status_code, primed=True)
+        return True
 
     def post_soap(self, endpoint: str, body: bytes, soap_action: str, *, _primed: bool = False) -> bytes:
         """POST a SOAP envelope. Returns raw bytes; fault parsing lives in :mod:`soap`.

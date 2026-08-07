@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import binascii
 import importlib
+import ipaddress
 import re
 import ssl
 import struct
@@ -119,6 +120,33 @@ INTEGRATED_PROVIDERS: tuple[tuple[str, str, str], ...] = (
     ),
     ("requests_gssapi", "HTTPSPNEGOAuth", "Kerberos — pip install 'spconnect[kerberos]'"),
     ("requests_kerberos", "HTTPKerberosAuth", "Kerberos, older binding — not installed by any extra"),
+)
+
+
+def base_url_is_bare_ip(base_url: str) -> bool:
+    """Is ``SP_BASE_URL``'s host an IP literal rather than a name?"""
+    host = urlsplit(base_url).hostname or ""
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
+
+
+#: Said whenever the base URL is an IP. Reaching a web front end directly is a
+#: legitimate move — it is how TLS termination gets taken out of the path — but by
+#: address it swaps one unknown for two, and both of the new ones present as a 401.
+BARE_IP_WARNING = (
+    "SP_BASE_URL is an IP address. That removes a proxy from the path and adds two "
+    "problems in its place, both of which look like a refused credential:\n"
+    "  - NTLM's target name comes from the host we dialled, so an address is not the "
+    "name the server expects to be called by. Extended Protection's service binding "
+    "check refuses that outright.\n"
+    "  - SharePoint routes by Host header through its Alternate Access Mappings, and "
+    "an IP is almost never one of them, so the request may not reach the site at all.\n"
+    "  To take TLS out of the path without changing the name, pin the hostname to the "
+    "web front end instead — an /etc/hosts entry — and leave SP_BASE_URL as it was. "
+    "The Host header and the NTLM target then stay correct and only the route changes."
 )
 
 
@@ -850,6 +878,8 @@ class Transport:
             # Registered before any request, so the scrubber can strip it from
             # every log line. In `integrated` mode there is nothing to register.
             register_secret(settings.password.get_secret_value(), username=settings.username)
+        if base_url_is_bare_ip(settings.base_url) and settings.auth_mode in ("ntlm", "integrated"):
+            log.warning("base_url.bare_ip", detail=BARE_IP_WARNING)
         self.limiter = RateLimiter(settings.requests_per_second)
         self.session = self._build_session(settings)
         self.server_version: ServerVersion | None = None

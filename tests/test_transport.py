@@ -13,6 +13,7 @@ import responses
 
 from conftest import WEB1, fixture_bytes, make_settings
 from spconnect.transport import (
+    BARE_IP_WARNING,
     AuthenticationError,
     BaseUrlRedirectError,
     NotFoundError,
@@ -22,6 +23,7 @@ from spconnect.transport import (
     SoapRedirectError,
     Transport,
     _looks_like_soap_fault,
+    base_url_is_bare_ip,
     denial_page,
     describe_auth_failure,
     parse_ntlm_challenge,
@@ -1281,3 +1283,79 @@ def test_a_farm_that_always_401s_terminates(rsps, ntlm_tp) -> None:
 
     # The call, then the two priming attempts, then done — no second real POST.
     assert [c.request.method for c in rsps.calls] == ["POST", "POST", "GET"]
+
+
+# --------------------------------------------------------------------------- #
+# reaching a web front end by address
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("base_url", "expected"),
+    [
+        ("http://10.1.2.3", True),
+        ("http://10.1.2.3:8080/sites/service", True),
+        ("https://[2001:db8::1]/sites/service", True),
+        ("https://crm.cine-project.de", False),
+        ("https://server11.cine-project.local:443/sites/service", False),
+    ],
+)
+def test_base_url_is_bare_ip(base_url: str, expected: bool) -> None:
+    assert base_url_is_bare_ip(base_url) is expected
+
+
+class _RecordingLog:
+    """Captures structlog calls, which caplog does not see."""
+
+    def __init__(self) -> None:
+        self.warnings: list[tuple[str, dict]] = []
+
+    def warning(self, event: str, **kw) -> None:
+        self.warnings.append((event, kw))
+
+    def info(self, *a, **kw) -> None:
+        pass
+
+    def debug(self, *a, **kw) -> None:
+        pass
+
+    def error(self, *a, **kw) -> None:
+        pass
+
+
+def test_an_ip_base_url_warns_about_what_it_swaps_in(tmp_path: Path, monkeypatch) -> None:
+    """Reaching the front end directly is a fair move; by address it costs two things.
+
+    Both present as a refused credential: NTLM's target name comes from the host we
+    dialled, and SharePoint routes by Host header through its Alternate Access
+    Mappings. An operator taking TLS termination out of the path deserves to be told
+    that an /etc/hosts pin does it without changing either.
+    """
+    recorder = _RecordingLog()
+    monkeypatch.setattr("spconnect.transport.log", recorder)
+
+    tp = Transport(make_settings(tmp_path, base_url="http://10.1.2.3:8080", auth_mode="ntlm", password="p"))
+    tp.close()
+
+    events = dict(recorder.warnings)
+    assert "base_url.bare_ip" in events
+    detail = events["base_url.bare_ip"]["detail"]
+    assert "NTLM's target name" in detail
+    assert "Alternate Access Mappings" in detail
+    assert "/etc/hosts" in detail
+
+
+def test_a_hostname_base_url_says_nothing(tmp_path: Path, monkeypatch) -> None:
+    recorder = _RecordingLog()
+    monkeypatch.setattr("spconnect.transport.log", recorder)
+
+    tp = Transport(make_settings(tmp_path, base_url="https://crm.example.de", auth_mode="ntlm", password="p"))
+    tp.close()
+
+    assert "base_url.bare_ip" not in dict(recorder.warnings)
+
+
+def test_the_bare_ip_warning_offers_the_alternative_that_keeps_the_name() -> None:
+    """A warning that only says "do not" leaves the operator where they started."""
+    assert "/etc/hosts" in BARE_IP_WARNING
+    assert "leave SP_BASE_URL as it was" in BARE_IP_WARNING

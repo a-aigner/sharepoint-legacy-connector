@@ -458,3 +458,61 @@ def test_probe_fails_at_login_when_sharepoint_denies_access(tmp_path: Path, mock
     assert "Enumerate webs" not in result.stdout
     # And the differential must not read that denial redirect as reaching the site.
     assert "cannot read this web at all" in result.stdout
+
+
+# --------------------------------------------------------------------------- #
+# probe-rest
+# --------------------------------------------------------------------------- #
+
+
+def test_probe_rest_succeeds_when_both_backends_work(env_file: Path, farm: FakeFarm) -> None:
+    result = run(env_file, "probe-rest")
+
+    assert result.exit_code == 0
+    assert "entity sets" in result.stdout
+    assert "REST ok, SOAP ok" in result.stdout
+    assert "Both work" in result.stdout
+
+
+def test_probe_rest_isolates_a_broken_post_from_a_broken_account(env_file: Path, farm: FakeFarm) -> None:
+    """The finding this command exists for: same directory, same credential, GET works."""
+    farm.fail_on["GetAllSubWebCollection"] = AuthenticationError("HTTP 401 for Webs.asmx")
+    farm.always_fail["GetWebCollection"] = "html_login_page.html"
+
+    result = run(env_file, "probe-rest")
+
+    assert result.exit_code == 0  # REST is reachable, which is the answer
+    assert "REST ok, SOAP failed" in result.stdout
+    assert "the failure belongs to the POST itself" in result.stdout
+    # And it must not be sold as a way to run the crawl.
+    assert "does NOT unblock a crawl" in result.stdout
+
+
+def test_probe_rest_says_when_odata_is_simply_off(env_file: Path, farm: FakeFarm) -> None:
+    farm.odata_broken = "odata_not_available.html"
+
+    result = run(env_file, "probe-rest")
+
+    assert result.exit_code == 1
+    assert "REST failed, SOAP ok" in result.stdout
+    assert "Keep SP_API_MODE=soap" in result.stdout
+
+
+def test_probe_rest_does_not_blame_the_method_when_both_fail(env_file: Path, farm: FakeFarm) -> None:
+    farm.odata_broken = "odata_not_available.html"
+    farm.fail_on["GetAllSubWebCollection"] = AuthenticationError("HTTP 401")
+    farm.always_fail["GetWebCollection"] = "html_login_page.html"
+
+    result = run(env_file, "probe-rest")
+
+    assert result.exit_code == 1
+    assert "REST failed, SOAP failed" in result.stdout
+    assert "not about the request method" in result.stdout
+
+
+def test_probe_rest_stops_on_a_redirecting_base_url(tmp_path: Path, mocked_responses) -> None:
+    mocked_responses.add(responses.GET, WEB1, status=302, headers={"Location": "https://sp/sites/service"})
+    result = run(ntlm_env_file(tmp_path), "probe-rest")
+
+    assert result.exit_code == 2
+    assert "SP_BASE_URL=https://sp/sites/service" in result.stdout

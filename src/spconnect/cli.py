@@ -427,6 +427,147 @@ def probe(ctx: typer.Context) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# probe-rest
+# --------------------------------------------------------------------------- #
+
+
+@app.command("probe-rest")
+def probe_rest(ctx: typer.Context) -> None:
+    """The same farm reached over REST instead of SOAP, as a second opinion.
+
+    ``ListData.svc`` sits in the **same ``_vti_bin`` directory** as
+    ``Webs.asmx`` and answers the **same credential**, but it is reached with a
+    ``GET`` rather than a SOAP ``POST``. That one difference is the point: when
+    ``probe`` fails at the first SOAP call, this separates a failure caused by
+    the *request* from one caused by the *account* or the *location*.
+
+    NTLM authenticates a connection, and IIS commonly drops that connection when
+    it rejects a request carrying a body — which fails the handshake for POSTs
+    while leaving bodyless GETs working. If REST succeeds here and SOAP does
+    not, that is the shape of it, and no amount of password or permission work
+    will help.
+    """
+    context = _ctx(ctx)
+    settings = context.settings
+    steps = StepReporter(enabled=settings.show_steps and settings.log_format != "json", total=5)
+
+    steps.heading(f"spconnect probe-rest -> {settings.base_url}")
+    steps.info(f"auth mode   : {settings.auth_mode} (user: {settings.username or '<none>'})")
+    steps.info(f"endpoint    : {settings.base_url}/_vti_bin/ListData.svc")
+    echo("")
+
+    auth: AuthProbe | None = None
+    rest_ok = False
+    soap_ok = False
+    soap_detail = ""
+
+    try:
+        with steps.step("Check the base URL") as st:
+            auth = context.transport.probe_auth_schemes()
+            if auth.error:
+                raise ConnectionError(auth.error)
+            Transport.raise_for_base_url_redirect(auth)
+            st.detail(f"HTTP {auth.status} — {auth.advice}")
+
+        service = ODataService(context.transport, settings.base_url)
+
+        with steps.step("Reach ListData.svc (a GET, not a SOAP POST)") as st:
+            ok, detail = service.available()
+            rest_ok = ok
+            st.detail(str(detail) if ok else "unavailable")
+            if not ok:
+                st.note(str(detail))
+
+        with steps.step("Read one row over REST") as st:
+            if not rest_ok:
+                st.detail("skipped — ListData.svc is not answering")
+            else:
+                sets = service.entity_sets()
+                if not sets:
+                    st.detail("no entity sets exposed")
+                else:
+                    page = service.get_items(sets[0], top=1)
+                    st.detail(f"{sets[0]}: {len(page.rows)} row(s)")
+                    for name in sets[:10]:
+                        st.note(f"- {name}")
+                    if len(sets) > 10:
+                        st.note(f"… and {len(sets) - 10} more")
+
+        with steps.step("Same web and credential, via SOAP (a POST)") as st:
+            # Deliberately not fatal, and not counted as a failed step: a SOAP
+            # failure here is the measurement this command exists to take.
+            try:
+                webs = WebsService(context.transport, settings.base_url).get_all_sub_web_collection()
+                soap_ok, soap_detail = True, f"{len(webs)} web(s)"
+            except Exception as exc:
+                soap_detail = f"{type(exc).__name__}: {str(exc).splitlines()[0]}"
+            if soap_ok:
+                st.detail(soap_detail)
+            else:
+                st.ok = False
+                st.note(soap_detail)
+
+        with steps.step("Verdict") as st:
+            st.detail(f"REST {'ok' if rest_ok else 'failed'}, SOAP {'ok' if soap_ok else 'failed'}")
+            for line in _rest_vs_soap_verdict(rest_ok, soap_ok):
+                st.note(line)
+
+    except AuthenticationError as exc:
+        steps.done()
+        report_auth_failure(context, settings, auth, exc)
+        raise typer.Exit(2) from exc
+    except RedirectRefused as exc:
+        steps.done()
+        report_refused_redirect(exc)
+        raise typer.Exit(2) from exc
+    except Exception as exc:
+        steps.done()
+        echo(f"\nFAILED: {type(exc).__name__}: {exc}")
+        raise typer.Exit(1) from exc
+    finally:
+        echo("")
+        echo(
+            f"{context.transport.request_count + context.transport.side_channel_requests} "
+            f"HTTP requests, {format_bytes(context.transport.bytes_received)} received"
+        )
+        context.close()
+
+    steps.done("REST reachable." if rest_ok else "REST NOT reachable.")
+    raise typer.Exit(0 if rest_ok else 1)
+
+
+def _rest_vs_soap_verdict(rest_ok: bool, soap_ok: bool) -> list[str]:
+    """What the two results together mean. The contrast is the whole point."""
+    if rest_ok and soap_ok:
+        return [
+            "Both work. Nothing is isolated here — whatever failed elsewhere is not",
+            "about REST versus SOAP.",
+        ]
+    if rest_ok and not soap_ok:
+        return [
+            "REST GET succeeds where the SOAP POST fails, on the same _vti_bin",
+            "directory with the same credential. The account and the location are",
+            "therefore fine, and the failure belongs to the POST itself — most",
+            "likely NTLM's connection binding being broken when IIS rejects a",
+            "request carrying a body.",
+            "Ask the farm admin for Kerberos/Negotiate, or run as a domain identity",
+            "with SP_AUTH_MODE=integrated.",
+            "NOTE: this does NOT unblock a crawl. SP_API_MODE=odata changes only",
+            "where *items* come from; web and list discovery still go over SOAP.",
+        ]
+    if not rest_ok and soap_ok:
+        return [
+            "SOAP works and REST does not — the OData feature is off, or this build",
+            "predates ListData.svc. Keep SP_API_MODE=soap; nothing is wrong.",
+        ]
+    return [
+        "Both fail the same way, so the failure is not about the request method.",
+        "That points at the credential's access to this web, or at _vti_bin being",
+        "restricted on this zone — not at SOAP. `spconnect permissions` next.",
+    ]
+
+
+# --------------------------------------------------------------------------- #
 # permissions
 # --------------------------------------------------------------------------- #
 

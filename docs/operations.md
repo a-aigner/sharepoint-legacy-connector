@@ -194,6 +194,7 @@ Interrupt-safe. Resume with `spconnect crawl --resume`.
 | Command | What it does |
 |---|---|
 | `spconnect probe` | Eight-step connectivity and capability check. Nonzero exit on failure. |
+| `spconnect probe-rest` | The same farm over REST instead of SOAP — isolates a broken POST from a broken account |
 | `spconnect permissions [--json] [--no-probe-items]` | What this credential can actually read, web by web and list by list |
 | `spconnect discover` | Webs + lists inventory. No items. |
 | `spconnect schema` | `GetList` per in-scope list; writes `list.json`, rebuilds the graph |
@@ -202,6 +203,27 @@ Interrupt-safe. Resume with `spconnect crawl --resume`.
 | `spconnect sync` | Incremental update via change tokens, including deletes |
 | `spconnect verify-time --list X --item N` | Raw vs decoded datetime vs display URL |
 | `spconnect stats` | Summarise the landing zone on disk |
+
+### Second opinion over REST
+
+When `probe` dies at the first SOAP call, `spconnect probe-rest` reaches the
+same farm a different way. It matters because `ListData.svc` sits in the **same
+`_vti_bin` directory** as `Webs.asmx` and answers the **same credential** — the
+only difference is a `GET` instead of a SOAP `POST`. That isolates the request
+from the account and the location:
+
+| REST | SOAP | Reading |
+|---|---|---|
+| ok | ok | Not a REST-versus-SOAP problem |
+| ok | fails | Account and location are fine; **the POST is the problem** — usually NTLM's connection binding breaking when IIS rejects a request carrying a body |
+| fails | ok | OData feature off, or a build older than `ListData.svc`. Keep `SP_API_MODE=soap` |
+| fails | fails | Not method-specific — permissions, or `_vti_bin` restricted on this zone |
+
+**A working REST probe does not unblock a crawl.** `SP_API_MODE=odata` changes
+only where *items* come from; web discovery (`Webs.asmx`), list discovery and
+field schema (`Lists.asmx`) and deletes (`GetListItemChangesSinceToken`) have no
+OData equivalent and stay on SOAP. Treat a REST-only success as a diagnosis, not
+a workaround.
 
 ### Checking what the account may read
 

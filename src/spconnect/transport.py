@@ -940,58 +940,103 @@ class Transport:
 
     # ---- convenience wrappers ----
 
-    def _prime_connection(self, endpoint: str) -> bool:
-        """Complete an NTLM handshake with a bodyless GET. ``True`` if it worked.
+    def _authenticated(self, response: requests.Response) -> bool:
+        """Did this exchange actually put a credential on the wire?
 
-        NTLM authenticates the TCP connection, not the request. IIS routinely
-        closes that connection when it rejects a request carrying a body, so the
-        three handshake legs land on different sockets and the POST can never
-        succeed — while a GET to the very same URL sails through.
-
-        Doing the handshake on a GET leaves the pooled connection authenticated,
-        and the POST that follows needs no handshake at all.
-
-        The GET result is also the safety check. If it is refused too, the
-        credential is genuinely being rejected and retrying the POST would only
-        spend a second failed authentication against an account that may have a
-        lockout policy.
+        A 2xx is not proof. Where SharePoint permits anonymous reads the request
+        is served without anyone being asked for anything, leaving the
+        connection exactly as unauthenticated as it was.
         """
+        headers = getattr(response.request, "headers", {}) or {}
+        return "authorization" in {k.lower() for k in headers}
+
+    def _prime_attempt(self, method: str, endpoint: str, **kwargs: Any) -> bool | None:
+        """One priming attempt. ``True`` primed, ``False`` refused, ``None`` inconclusive."""
         try:
             self.limiter.acquire()
             self.side_channel_requests += 1
-            response = self.session.get(
-                endpoint, timeout=self.settings.timeout_seconds, allow_redirects=False
+            response = self.session.request(
+                method,
+                endpoint,
+                timeout=self.settings.timeout_seconds,
+                allow_redirects=False,
+                **kwargs,
             )
         except (requests.ConnectionError, requests.Timeout) as exc:
-            log.debug("ntlm_prime.failed", endpoint=endpoint, error=str(exc))
-            return False
+            log.debug("ntlm_prime.failed", method=method, endpoint=endpoint, error=str(exc))
+            return None
 
-        if response.status_code >= 400:
-            log.info("ntlm_prime", endpoint=endpoint, status=response.status_code, primed=False)
-            return False
-
-        # A 200 is not proof of a handshake. Where SharePoint permits anonymous
-        # reads, the GET succeeds without ever being challenged and without
-        # sending a credential — leaving the connection exactly as
-        # unauthenticated as it was, so retrying the POST on it would change
-        # nothing and merely obscure the real problem.
-        request_headers = getattr(response.request, "headers", {}) or {}
-        if "authorization" not in {k.lower() for k in request_headers}:
-            log.warning(
-                "ntlm_prime.anonymous",
-                endpoint=endpoint,
-                status=response.status_code,
-                detail=(
-                    "the GET succeeded WITHOUT authenticating — this endpoint serves it "
-                    "anonymously, so it cannot authenticate the connection and priming "
-                    "would achieve nothing. The POST needs a credential the server is "
-                    "never asking for."
-                ),
+        # Refusal is checked first, and deliberately: a request that carried a
+        # credential and was still refused means the credential was rejected,
+        # which is the opposite of primed.
+        if response.status_code in (401, 403):
+            log.info(
+                "ntlm_prime", method=method, endpoint=endpoint, status=response.status_code, primed=False
             )
             return False
+        if self._authenticated(response):
+            log.info("ntlm_prime", method=method, endpoint=endpoint, status=response.status_code, primed=True)
+            return True
+        log.debug("ntlm_prime.anonymous", method=method, endpoint=endpoint, status=response.status_code)
+        return None
 
-        log.info("ntlm_prime", endpoint=endpoint, status=response.status_code, primed=True)
-        return True
+    def _prime_connection(self, endpoint: str, soap_action: str | None = None) -> bool:
+        """Get an NTLM handshake done where it can succeed. ``True`` if it did.
+
+        NTLM authenticates the TCP connection, not the request, and the
+        handshake takes three round trips. ``requests-ntlm`` replays the **full
+        body** on all three, where WinHTTP and .NET send the early legs empty
+        and attach the body only to the final authenticated one. IIS commonly
+        tears the connection down when it 401s a request carrying a body — the
+        server logs a logon immediately followed by a logoff — so the legs land
+        on different sockets and the negotiation can never complete.
+
+        Two attempts, in order:
+
+        1. **An empty POST** to the same endpoint. Same method, same URL, no
+           body to provoke the teardown. Preferred because it differs from the
+           real call in exactly one respect, so nothing method-specific can
+           explain away the result.
+        2. **A bodyless GET**, for farms that answer a contentless POST oddly.
+
+        Either way the credential must actually be exercised: a request served
+        anonymously proves nothing and primes nothing. And a refusal stops the
+        whole thing — retrying then would spend a second failed authentication
+        against an account that may have a lockout policy.
+        """
+        attempts: list[tuple[str, dict[str, Any]]] = []
+        if soap_action is not None:
+            attempts.append(
+                (
+                    "POST",
+                    {
+                        "data": b"",
+                        "headers": {
+                            "Content-Type": "text/xml; charset=utf-8",
+                            "SOAPAction": f'"{soap_action}"',
+                        },
+                    },
+                )
+            )
+        attempts.append(("GET", {}))
+
+        for method, kwargs in attempts:
+            outcome = self._prime_attempt(method, endpoint, **kwargs)
+            if outcome is True:
+                return True
+            if outcome is False:
+                return False  # refused outright: do not spend another attempt
+
+        log.warning(
+            "ntlm_prime.anonymous",
+            endpoint=endpoint,
+            detail=(
+                "nothing we sent was challenged — this endpoint served us without asking "
+                "for a credential, so there is no authenticated connection to reuse. The "
+                "POST needs a credential the server is never asking for."
+            ),
+        )
+        return False
 
     def post_soap(self, endpoint: str, body: bytes, soap_action: str, *, _primed: bool = False) -> bytes:
         """POST a SOAP envelope. Returns raw bytes; fault parsing lives in :mod:`soap`.
@@ -1015,7 +1060,7 @@ class Transport:
                 and self.settings.ntlm_prime_connection
                 and self.settings.auth_mode in ("ntlm", "integrated")
             )
-            if not eligible or not self._prime_connection(endpoint):
+            if not eligible or not self._prime_connection(endpoint, soap_action):
                 raise
             log.warning(
                 "ntlm_prime.retry",

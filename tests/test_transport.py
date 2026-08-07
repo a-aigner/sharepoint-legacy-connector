@@ -714,61 +714,78 @@ def ntlm_tp(tmp_path: Path) -> Transport:
     return transport
 
 
-def test_a_post_refused_where_a_get_succeeds_is_retried_and_works(rsps, ntlm_tp: Transport) -> None:
-    rsps.add(responses.POST, ENDPOINT, status=401)  # the body kills the handshake
-    rsps.add(responses.GET, ENDPOINT, status=200, body="<html>service description</html>")
+def test_a_post_refused_where_priming_succeeds_is_retried_and_works(rsps, ntlm_tp) -> None:
+    """The real POST fails, an empty POST negotiates, the real POST then works."""
+    rsps.add(responses.POST, ENDPOINT, status=401)  # body kills the handshake
+    rsps.add(responses.POST, ENDPOINT, status=500, body="<fault/>")  # empty POST: negotiates
     rsps.add(responses.POST, ENDPOINT, status=200, body="<ok/>")
 
     assert ntlm_tp.post_soap(ENDPOINT, b"<x/>", "op") == b"<ok/>"
 
-    assert [c.request.method for c in rsps.calls] == ["POST", "GET", "POST"]
+    assert [c.request.method for c in rsps.calls] == ["POST", "POST", "POST"]
+    # The priming POST must carry no body — that is the entire point of it.
+    assert not rsps.calls[1].request.body
+    assert rsps.calls[2].request.body == b"<x/>"
 
 
-def test_a_genuinely_refused_credential_is_not_retried(rsps, ntlm_tp: Transport) -> None:
-    """The GET is the safety check: if it is refused too, the account is the problem.
+def test_priming_falls_back_to_a_get(rsps, ntlm_tp) -> None:
+    """Some farms answer a contentless POST oddly; a bodyless GET still primes."""
+    rsps.add(responses.POST, ENDPOINT, status=401)
+    # IIS drops the connection on the contentless POST: nothing was established.
+    rsps.add(responses.POST, ENDPOINT, body=requests.ConnectionError("reset by peer"))
+    rsps.add(responses.GET, ENDPOINT, status=200, body="<html/>")
+    rsps.add(responses.POST, ENDPOINT, status=200, body="<ok/>")
+
+    assert ntlm_tp.post_soap(ENDPOINT, b"<x/>", "op") == b"<ok/>"
+    assert [c.request.method for c in rsps.calls] == ["POST", "POST", "GET", "POST"]
+
+
+def test_a_genuinely_refused_credential_is_not_retried(rsps, ntlm_tp) -> None:
+    """A credential that is sent and still refused is rejected, not unprimed.
 
     Retrying there would spend a second failed authentication against an account
     that may well have a lockout policy.
     """
     rsps.add(responses.POST, ENDPOINT, status=401)
-    rsps.add(responses.GET, ENDPOINT, status=401)
+    rsps.add(responses.POST, ENDPOINT, status=401)
 
     with pytest.raises(AuthenticationError):
         ntlm_tp.post_soap(ENDPOINT, b"<x/>", "op")
 
-    # One probing GET, and no second POST.
-    assert [c.request.method for c in rsps.calls] == ["POST", "GET"]
+    # One priming attempt, no fallback, and no second real POST.
+    assert [c.request.method for c in rsps.calls] == ["POST", "POST"]
 
 
-def test_priming_is_attempted_only_once(rsps, ntlm_tp: Transport) -> None:
+def test_priming_is_attempted_only_once(rsps, ntlm_tp) -> None:
     """A farm that 401s the POST even after priming must not loop."""
     rsps.add(responses.POST, ENDPOINT, status=401)
-    rsps.add(responses.GET, ENDPOINT, status=200)
+    rsps.add(responses.POST, ENDPOINT, status=200)
     rsps.add(responses.POST, ENDPOINT, status=401)
 
     with pytest.raises(AuthenticationError):
         ntlm_tp.post_soap(ENDPOINT, b"<x/>", "op")
 
-    assert [c.request.method for c in rsps.calls] == ["POST", "GET", "POST"]
+    assert [c.request.method for c in rsps.calls] == ["POST", "POST", "POST"]
 
 
-def test_a_get_served_anonymously_does_not_count_as_priming(rsps, tmp_path: Path) -> None:
-    """A 200 is not proof of a handshake.
+def test_nothing_being_challenged_does_not_count_as_priming(rsps, tmp_path: Path) -> None:
+    """A 2xx is not proof of a handshake.
 
-    Where SharePoint permits anonymous reads the GET succeeds without ever being
-    challenged, so the connection is left exactly as unauthenticated as it was.
-    Retrying the POST on it would change nothing and hide the real problem —
-    that the server is not asking for a credential at all.
+    Where SharePoint permits anonymous access the request is served without
+    anyone being asked for anything, so the connection is left exactly as
+    unauthenticated as it was. Retrying the POST on it would change nothing and
+    hide the real problem — that the server is not asking for a credential.
     """
     tp = Transport(make_settings(tmp_path, auth_mode="ntlm", username="u", password="p"))
-    tp.session.auth = None  # nothing attaches a credential: the GET is anonymous
+    tp.session.auth = None  # nothing attaches a credential: everything is anonymous
     rsps.add(responses.POST, ENDPOINT, status=401)
+    rsps.add(responses.POST, ENDPOINT, status=200)
     rsps.add(responses.GET, ENDPOINT, status=200, body="<html>anyone may read this</html>")
 
     with pytest.raises(AuthenticationError):
         tp.post_soap(ENDPOINT, b"<x/>", "op")
 
-    assert [c.request.method for c in rsps.calls] == ["POST", "GET"]
+    assert [c.request.method for c in rsps.calls] == ["POST", "POST", "GET"]
 
 
 def test_priming_can_be_switched_off(rsps, tmp_path: Path) -> None:

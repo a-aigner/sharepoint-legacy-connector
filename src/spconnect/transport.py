@@ -155,6 +155,40 @@ class AuthenticationError(TransportError):
     """401/403. Never retried — a bad credential must fail fast and loudly."""
 
 
+#: Pages SharePoint sends an *authenticated but unauthorised* browser request
+#: to. They answer **HTTP 200** and carry the normal version header, so a status
+#: check reads them as success — which is how an account with no permissions at
+#: all can sail through a login step and fail three steps later on the first
+#: request that has no friendly page to redirect to.
+DENIAL_PAGES = ("accessdenied.aspx", "login.aspx", "signin.aspx", "authenticate.aspx")
+
+
+def denial_page(*urls: str) -> str | None:
+    """The first URL that is a sign-in or access-denied page, if any."""
+    for url in urls:
+        lowered = (url or "").lower()
+        if any(marker in lowered for marker in DENIAL_PAGES):
+            return url
+    return None
+
+
+class SharePointAccessDenied(AuthenticationError):
+    """IIS accepted the credential; SharePoint then refused it access.
+
+    Two different systems say no in two different ways here. IIS decides
+    *whether you are who you say you are* and answers 401 when it doubts you.
+    SharePoint decides *whether that identity may read this* and, for a browser
+    request, answers by redirecting to an access-denied page with status 200.
+
+    Subclasses :class:`AuthenticationError` on purpose. It is an authorisation
+    failure rather than an authentication one, but every caller that already
+    handles a refused login — the exit code, the shared diagnostic report, the
+    re-raise in the web walk — should treat it identically, and a parallel
+    hierarchy would mean each of them growing a second ``except`` that someone
+    eventually forgets.
+    """
+
+
 NTLM_SIGNATURE = b"NTLMSSP\x00"
 
 #: A minimal NTLM *Type 1* (Negotiate) message, constant because it carries no
@@ -691,6 +725,9 @@ class Transport:
         self.server_version: ServerVersion | None = None
         #: Set by :meth:`probe_version`: did the winning request carry a credential?
         self.version_probe_authenticated: bool | None = None
+        #: Set by :meth:`probe_version`: the sign-in or access-denied page we were
+        #: sent to instead of the site, if we were.
+        self.version_probe_denied_by: str | None = None
         self.request_count = 0
         self.bytes_received = 0
         #: Requests the diagnostics send outside :meth:`_send` — the auth probe,
@@ -987,11 +1024,13 @@ class Transport:
             log.info("ntlm_domain", **found.as_dict())
         return found
 
-    def _status_of(self, method: str, url: str) -> str:
-        """Status of one authenticated request, as text. Never raises.
+    def _status_of(self, method: str, url: str) -> tuple[str, bool]:
+        """``(description, reached_it)`` for one authenticated request. Never raises.
 
         Bypasses :meth:`_send` deliberately: there a 401 is an exception, and
-        here it is the measurement.
+        here it is the measurement. Redirects are not followed, so a redirect to
+        an access-denied page is visible as itself rather than as the 200 that
+        page would have returned.
         """
         try:
             self.limiter.acquire()
@@ -1000,8 +1039,14 @@ class Transport:
                 method, url, timeout=self.settings.timeout_seconds, allow_redirects=False
             )
         except (requests.ConnectionError, requests.Timeout) as exc:
-            return f"{type(exc).__name__}"
-        return str(response.status_code)
+            return type(exc).__name__, False
+
+        location = response.headers.get("Location", "")
+        if denied := denial_page(location):
+            return f"{response.status_code} -> {denied}", False
+        if location:
+            return f"{response.status_code} -> {location}", response.status_code < 400
+        return str(response.status_code), response.status_code < 400
 
     def diagnose_endpoint_auth(self, endpoint: str) -> list[str]:
         """Separate "this credential is refused" from "this *request* is refused".
@@ -1030,8 +1075,8 @@ class Transport:
         than asking the operator to reproduce it by hand.
         """
         root = self.settings.base_url
-        root_get = self._status_of("GET", root)
-        endpoint_get = self._status_of("GET", endpoint)
+        root_get, root_ok = self._status_of("GET", root)
+        endpoint_get, endpoint_ok = self._status_of("GET", endpoint)
 
         lines = [
             "Differential check (the POST failed — do bodyless GETs?):",
@@ -1039,14 +1084,13 @@ class Transport:
             f"  GET {endpoint} -> HTTP {endpoint_get}",
         ]
 
-        ok = {"200", "302", "301"}
-        if root_get in ok and endpoint_get in ok:
+        if root_ok and endpoint_ok:
             lines.append(
                 "  => The credential is accepted for both. Only the POST fails, which "
                 "points at the NTLM handshake over a request with a body rather than at "
                 "the account. Ask for Kerberos/Negotiate, or try SP_AUTH_MODE=integrated."
             )
-        elif root_get in ok:
+        elif root_ok:
             lines.append(
                 "  => The account reaches the site but not _vti_bin. Ask the SharePoint "
                 "admin whether the web services are restricted on this zone, and whether "
@@ -1093,6 +1137,14 @@ class Transport:
                 response = self.request("GET", target, allow_redirects=True)
         except NotFoundError:
             response = self.request("GET", self.settings.base_url + "/_vti_bin/Lists.asmx")
+
+        # Where we actually ended up. A 200 proves a page was served, not that
+        # it was the page we asked for: SharePoint answers "you may not read
+        # this" by redirecting to an access-denied page that returns 200 and
+        # carries the version header, so status alone cannot tell the two apart.
+        self.version_probe_denied_by = denial_page(
+            response.url, *(step.headers.get("Location", "") for step in response.history)
+        )
 
         # Whether the credential was actually exercised, as opposed to the
         # request simply being allowed through. "login successful" asserted from

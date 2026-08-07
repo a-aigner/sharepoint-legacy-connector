@@ -420,3 +420,41 @@ def test_permissions_emits_the_same_auth_evidence_as_probe(env_file: Path, farm:
     assert "AUTH FAILED" in result.stdout
     assert "Differential check" in result.stdout
     assert "Permissions cannot be assessed until the login works." in result.stdout
+
+
+def test_probe_fails_at_login_when_sharepoint_denies_access(tmp_path: Path, mocked_responses) -> None:
+    """The exact shape of the reported farm: step 3 passed, step 5 died on a 401.
+
+    SharePoint answers an authenticated-but-unauthorised browser request by
+    redirecting to a page that returns 200 and carries the version header, so
+    the login step passed and the first request with no page to redirect to —
+    the SOAP call — failed instead, three steps from the cause.
+    """
+    denied = f"{WEB1}/_layouts/AccessDenied.aspx?Source=%2F"
+    env = tmp_path / "basic.env"
+    env.write_text(
+        f"SP_BASE_URL={WEB1}\nSP_AUTH_MODE=basic\nSP_USERNAME=pkober\nSP_PASSWORD=x\n"
+        f"SP_REQUESTS_PER_SECOND=10000\nSP_LANDING_DIR={tmp_path / 'l'}\n"
+        f"SP_STATE_FILE={tmp_path / 'l' / 's.json'}\nSP_LOG_LEVEL=CRITICAL\n",
+        encoding="utf-8",
+    )
+    mocked_responses.add(responses.GET, WEB1, status=401, headers={"WWW-Authenticate": "Basic"})
+    mocked_responses.add(responses.HEAD, WEB1, status=302, headers={"Location": denied})
+    mocked_responses.add(
+        responses.HEAD,
+        denied,
+        status=200,
+        headers={"MicrosoftSharePointTeamServices": "14.0.0.7149"},
+    )
+    mocked_responses.add(responses.GET, WEB1, status=302, headers={"Location": denied})
+    mocked_responses.add(responses.GET, f"{WEB1}/_vti_bin/Webs.asmx", status=401)
+
+    result = run(env, "probe")
+
+    assert result.exit_code == 2
+    assert "SharePoint sent us to" in result.stdout
+    assert "permissions problem" in result.stdout
+    # It must not sail past this into the steps that depend on a working login.
+    assert "Enumerate webs" not in result.stdout
+    # And the differential must not read that denial redirect as reaching the site.
+    assert "cannot read this web at all" in result.stdout

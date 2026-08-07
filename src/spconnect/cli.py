@@ -33,6 +33,7 @@ from .transport import (
     AuthProbe,
     IntegratedAuthUnavailable,
     RedirectRefused,
+    SharePointAccessDenied,
     Transport,
 )
 
@@ -310,6 +311,20 @@ def probe(ctx: typer.Context) -> None:
         )
         with steps.step(f"Authenticate as {identity}") as st:
             version = context.transport.probe_version()
+            if denied := context.transport.version_probe_denied_by:
+                # A 200 from an access-denied page is still a 200. Letting this
+                # step pass hands the next failure a wrong premise: the login is
+                # fine, and everything after it fails for a reason that has
+                # nothing to do with the credential.
+                raise SharePointAccessDenied(
+                    f"signed in, but SharePoint sent us to {denied}\n"
+                    "  IIS accepted the credential and SharePoint then refused it access.\n"
+                    "  That page answers HTTP 200, so this step used to pass and the first\n"
+                    "  request with no friendly page to redirect to — the SOAP call — failed\n"
+                    "  instead, several steps away from the cause.\n"
+                    f"  This is a permissions problem: grant '{settings.username}' Read on\n"
+                    "  the root web. The password is not the issue."
+                )
             if settings.auth_mode == "anonymous":
                 st.detail("reached (anonymous — no credential configured)")
             elif context.transport.version_probe_authenticated:

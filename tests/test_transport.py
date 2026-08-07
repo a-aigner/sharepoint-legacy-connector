@@ -22,6 +22,7 @@ from spconnect.transport import (
     SoapRedirectError,
     Transport,
     _looks_like_soap_fault,
+    denial_page,
     describe_auth_failure,
     parse_ntlm_challenge,
     redirect_target,
@@ -612,3 +613,69 @@ def test_the_configured_scheme_not_being_offered_is_named_as_such() -> None:
 def test_negotiate_counts_as_offering_ntlm() -> None:
     message = describe_auth_failure(a_401(challenge="Negotiate"), auth_mode="ntlm", username="CONTOSO\\p")
     assert "does not offer" not in message
+
+
+# --------------------------------------------------------------------------- #
+# authenticated, but not authorised
+#
+# IIS decides whether you are who you say you are, and answers 401 when it
+# doubts you. SharePoint decides whether that identity may read this, and
+# answers a browser request by redirecting to a page that returns 200. A status
+# check cannot tell the second one from success.
+# --------------------------------------------------------------------------- #
+
+
+DENIED_URL = "http://sp/sites/service/_layouts/AccessDenied.aspx?Source=%2F"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        DENIED_URL,
+        "http://sp/_layouts/login.aspx?ReturnUrl=%2f",
+        "http://sp/_forms/signin.aspx",
+        "HTTP://SP/_LAYOUTS/ACCESSDENIED.ASPX",  # case is the server's business
+    ],
+)
+def test_denial_pages_are_recognised(url: str) -> None:
+    assert denial_page(url) == url
+
+
+@pytest.mark.parametrize("url", ["http://sp/sites/service", "http://sp/default.aspx", ""])
+def test_ordinary_pages_are_not_mistaken_for_denials(url: str) -> None:
+    assert denial_page(url) is None
+
+
+def test_landing_on_access_denied_is_recorded_by_the_version_probe(rsps, tp: Transport) -> None:
+    """The page answers 200 with the version header, so status alone reads as success."""
+    rsps.add(responses.HEAD, WEB1, status=302, headers={"Location": DENIED_URL})
+    rsps.add(
+        responses.HEAD,
+        DENIED_URL,
+        status=200,
+        headers={"MicrosoftSharePointTeamServices": "14.0.0.7149"},
+    )
+
+    version = tp.probe_version()
+
+    assert version.raw == "14.0.0.7149"  # the header really is there
+    assert tp.version_probe_denied_by is not None
+    assert "AccessDenied.aspx" in tp.version_probe_denied_by
+
+
+def test_a_normal_landing_is_not_flagged(rsps, tp: Transport) -> None:
+    rsps.add(responses.HEAD, WEB1, status=200, headers={"MicrosoftSharePointTeamServices": "14.0"})
+    tp.probe_version()
+    assert tp.version_probe_denied_by is None
+
+
+def test_the_differential_does_not_count_a_denial_redirect_as_reaching_the_site(rsps, tp: Transport) -> None:
+    rsps.add(responses.GET, WEB1, status=302, headers={"Location": DENIED_URL})
+    rsps.add(responses.GET, ENDPOINT, status=401)
+
+    lines = "\n".join(tp.diagnose_endpoint_auth(ENDPOINT))
+
+    assert "AccessDenied.aspx" in lines
+    # Counting that 302 as success would have read this as "_vti_bin is
+    # restricted" when in fact the account cannot read the site at all.
+    assert "cannot read this web at all" in lines

@@ -120,6 +120,18 @@ class Settings(BaseSettings):
     #: the handshake for POSTs while leaving GETs working. Priming the connection
     #: with a GET first gets the handshake done where it can succeed.
     ntlm_prime_connection: bool = True
+    #: A URL known to *demand* a credential, used to get the NTLM handshake done
+    #: before the SOAP POST is sent.
+    #:
+    #: Only needed where anonymous access is enabled. There the contentless
+    #: requests priming normally uses are served without any challenge at all, so
+    #: no authenticated connection is ever established — and the one request the
+    #: farm does challenge is the SOAP POST, whose handshake is the thing that
+    #: cannot complete. Priming has nowhere to stand.
+    #:
+    #: Blank means try the built-in candidates. Anything that 401s and then serves
+    #: this account will do; ``/_layouts/viewlsts.aspx`` usually does.
+    ntlm_prime_url: str = ""
     #: Bind the NTLM Type 3 to the server's TLS certificate (a Channel Binding
     #: Token). On by default because IIS with Extended Protection set to
     #: *Required* refuses a Type 3 that lacks one. Turn it **off** when TLS is

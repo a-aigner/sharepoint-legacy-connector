@@ -828,6 +828,25 @@ class CompletedHandshake:
         return request
 
 
+class ChallengedOnlyBy:
+    """A credential appears only for the URLs this farm actually challenges.
+
+    ``requests-ntlm`` attaches ``Authorization`` inside its 401 retry path and
+    nowhere else, so a request to a URL served anonymously goes out bare. Per-URL
+    is what a farm with anonymous access enabled looks like, and it is the one
+    shape :class:`CompletedHandshake` cannot express — it credits every request,
+    which makes an unchallenged endpoint look like a primed one.
+    """
+
+    def __init__(self, *markers: str) -> None:
+        self.markers = markers
+
+    def __call__(self, request):
+        if any(marker in request.url for marker in self.markers):
+            request.headers["Authorization"] = "NTLM <negotiated>"
+        return request
+
+
 class HandshakeThenPreauthenticatedConnection:
     """A handshake, and then the bare requests that ride the connection it won.
 
@@ -961,6 +980,75 @@ def test_priming_is_attempted_only_once(rsps, ntlm_tp) -> None:
     assert [c.request.method for c in rsps.calls] == ["POST", "POST", "POST"]
 
 
+def test_priming_uses_a_page_that_refuses_anonymous_callers(rsps, ntlm_tp) -> None:
+    """The reported farm's shape, and the reason priming could not work on it.
+
+    With anonymous access enabled, every contentless request to _vti_bin is served
+    without a challenge — so no handshake starts and no authenticated connection is
+    ever left in the pool. Meanwhile the one request the farm does challenge is the
+    SOAP POST, whose handshake is exactly what cannot complete. Priming had nowhere
+    to stand until it was allowed to knock on a door that is actually locked.
+    """
+    ntlm_tp.session.auth = ChallengedOnlyBy("/_layouts/viewlsts.aspx")
+    rsps.add(responses.POST, ENDPOINT, status=401)  # the real POST
+    rsps.add(responses.POST, ENDPOINT, status=400)  # empty POST: anonymous, unchallenged
+    rsps.add(responses.GET, ENDPOINT, status=200, body="<html/>")  # GET: anonymous too
+    rsps.add(responses.GET, f"{WEB1}/_layouts/viewlsts.aspx", status=200, body="<html/>")
+    rsps.add(responses.POST, ENDPOINT, status=200, body="<ok/>")
+
+    assert ntlm_tp.post_soap(ENDPOINT, b"<x/>", "op") == b"<ok/>"
+
+    urls = [c.request.url for c in rsps.calls]
+    assert urls[3].endswith("/_layouts/viewlsts.aspx"), "primed against a page that demands login"
+    assert [c.request.method for c in rsps.calls] == ["POST", "POST", "GET", "GET", "POST"]
+
+
+def test_an_explicit_prime_url_is_used_alone(rsps, tmp_path: Path) -> None:
+    """An operator who found a URL that challenges knows more than our guesses.
+
+    Spending further failed logons after theirs helps nobody, so the candidates are
+    not tried as well.
+    """
+    tp = Transport(
+        make_settings(
+            tmp_path,
+            auth_mode="ntlm",
+            username="CONTOSO\\p",
+            password="pw",
+            max_retries=1,
+            ntlm_prime_url=f"{WEB1}/_layouts/mine.aspx",
+        )
+    )
+    tp.session.auth = ChallengedOnlyBy("/_layouts/mine.aspx")
+    rsps.add(responses.POST, ENDPOINT, status=401)
+    rsps.add(responses.POST, ENDPOINT, status=400)
+    rsps.add(responses.GET, ENDPOINT, status=200, body="<html/>")
+    rsps.add(responses.GET, f"{WEB1}/_layouts/mine.aspx", status=200, body="<html/>")
+    rsps.add(responses.POST, ENDPOINT, status=200, body="<ok/>")
+
+    assert tp.post_soap(ENDPOINT, b"<x/>", "op") == b"<ok/>"
+
+    urls = [c.request.url for c in rsps.calls]
+    assert urls[3].endswith("/_layouts/mine.aspx")
+    assert not any("viewlsts" in u for u in urls), "the built-in candidates are skipped"
+
+
+def test_a_farm_that_challenges_nothing_at_all_says_so_and_names_the_setting(rsps, ntlm_tp) -> None:
+    tp = ntlm_tp
+    tp.session.auth = None  # nothing ever attaches a credential
+    rsps.add(responses.POST, ENDPOINT, status=401)
+    rsps.add(responses.POST, ENDPOINT, status=400)
+    rsps.add(responses.GET, ENDPOINT, status=200, body="<html/>")
+    rsps.add(responses.GET, f"{WEB1}/_layouts/viewlsts.aspx", status=200, body="<html/>")
+    rsps.add(responses.GET, f"{WEB1}/_layouts/settings.aspx", status=200, body="<html/>")
+
+    with pytest.raises(AuthenticationError):
+        tp.post_soap(ENDPOINT, b"<x/>", "op")
+
+    # All candidates tried, and no second real POST on a connection that is not there.
+    assert [c.request.method for c in rsps.calls] == ["POST", "POST", "GET", "GET", "GET"]
+
+
 def test_nothing_being_challenged_does_not_count_as_priming(rsps, tmp_path: Path) -> None:
     """A 2xx is not proof of a handshake.
 
@@ -974,11 +1062,15 @@ def test_nothing_being_challenged_does_not_count_as_priming(rsps, tmp_path: Path
     rsps.add(responses.POST, ENDPOINT, status=401)
     rsps.add(responses.POST, ENDPOINT, status=200)
     rsps.add(responses.GET, ENDPOINT, status=200, body="<html>anyone may read this</html>")
+    for path in ("/_layouts/viewlsts.aspx", "/_layouts/settings.aspx"):
+        rsps.add(responses.GET, f"{WEB1}{path}", status=200, body="<html>also anonymous</html>")
 
     with pytest.raises(AuthenticationError):
         tp.post_soap(ENDPOINT, b"<x/>", "op")
 
-    assert [c.request.method for c in rsps.calls] == ["POST", "POST", "GET"]
+    # Every candidate tried, and still no second real POST: there is no
+    # authenticated connection anywhere on this farm to put one on.
+    assert [c.request.method for c in rsps.calls] == ["POST", "POST", "GET", "GET", "GET"]
 
 
 def test_priming_can_be_switched_off(rsps, tmp_path: Path) -> None:

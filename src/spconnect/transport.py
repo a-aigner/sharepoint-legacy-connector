@@ -1048,6 +1048,24 @@ class Transport:
         log.debug("ntlm_prime.anonymous", method=method, endpoint=endpoint, status=response.status_code)
         return None
 
+    #: Pages that normally refuse an anonymous caller even where anonymous access
+    #: is enabled for content, so a handshake can be got done against one. Not
+    #: exhaustive and not guaranteed — the point is to try before asking an
+    #: operator to go and find one.
+    PRIME_CANDIDATE_PATHS: tuple[str, ...] = ("/_layouts/viewlsts.aspx", "/_layouts/settings.aspx")
+
+    def _prime_urls(self) -> list[str]:
+        """URLs to attempt a handshake against, after the endpoint itself.
+
+        ``SP_NTLM_PRIME_URL`` wins outright and is used alone: an operator who has
+        found a URL that challenges knows more than this list does, and spending
+        further failed logons after theirs helps nobody.
+        """
+        configured = self.settings.ntlm_prime_url.strip()
+        if configured:
+            return [configured]
+        return [f"{self.settings.base_url}{path}" for path in self.PRIME_CANDIDATE_PATHS]
+
     def _prime_connection(self, endpoint: str, soap_action: str | None = None) -> bool:
         """Get an NTLM handshake done where it can succeed. ``True`` if it did.
 
@@ -1059,13 +1077,25 @@ class Transport:
         server logs a logon immediately followed by a logoff — so the legs land
         on different sockets and the negotiation can never complete.
 
-        Two attempts, in order:
+        Attempts, in order, stopping at the first that authenticates:
 
         1. **An empty POST** to the same endpoint. Same method, same URL, no
            body to provoke the teardown. Preferred because it differs from the
            real call in exactly one respect, so nothing method-specific can
            explain away the result.
         2. **A bodyless GET**, for farms that answer a contentless POST oddly.
+        3. **A GET to a URL that demands a credential** — ``SP_NTLM_PRIME_URL``,
+           or the built-in candidates.
+
+        The third exists because the first two are useless on a farm with
+        **anonymous access enabled**, which is not a rare configuration. There
+        every contentless request to ``_vti_bin`` is served without a challenge,
+        so no handshake ever starts and no authenticated connection is ever left
+        in the pool — while the one request the farm *does* challenge is the SOAP
+        POST, whose handshake is precisely what cannot complete. Priming has
+        nowhere to stand, and the previous two attempts merely confirm it.
+        Somewhere that refuses anonymous callers is the only place a handshake
+        can be got done at all.
 
         Either way the credential must actually be exercised: a request served
         anonymously proves nothing and primes nothing.
@@ -1080,11 +1110,12 @@ class Transport:
         worse trade. Two attempts remains the ceiling, so a refused GET is the
         end of it.
         """
-        attempts: list[tuple[str, dict[str, Any]]] = []
+        attempts: list[tuple[str, str, dict[str, Any]]] = []
         if soap_action is not None:
             attempts.append(
                 (
                     "POST",
+                    endpoint,
                     {
                         "data": b"",
                         "headers": {
@@ -1094,15 +1125,29 @@ class Transport:
                     },
                 )
             )
-        attempts.append(("GET", {}))
+        attempts.append(("GET", endpoint, {}))
 
         refused = False
-        for method, kwargs in attempts:
-            outcome = self._prime_attempt(method, endpoint, **kwargs)
+        for method, url, kwargs in attempts:
+            outcome = self._prime_attempt(method, url, **kwargs)
             if outcome is True:
                 return True
             if outcome is False:
                 refused = True
+
+        # Somewhere that refuses anonymous callers, but *only* when nothing above
+        # was challenged. A refusal on the endpoint means the credential is being
+        # rejected, and further URLs would spend more failed logons to learn what
+        # is already known — against an account that may have a lockout policy.
+        if not refused:
+            for url in self._prime_urls():
+                outcome = self._prime_attempt("GET", url)
+                if outcome is True:
+                    return True
+                if outcome is False:
+                    refused = True
+                    break
+                attempts.append(("GET", url, {}))
 
         if refused:
             # Worth separating from the case below: "refused" and "never asked"
@@ -1122,9 +1167,13 @@ class Transport:
         log.warning(
             "ntlm_prime.anonymous",
             endpoint=endpoint,
+            tried=[url for _, url, _ in attempts],
             detail=(
-                "nothing we sent was challenged — this endpoint served us without asking "
-                "for a credential, so there is no authenticated connection to reuse. The "
+                "nothing we sent was challenged — not even a page that normally refuses "
+                "anonymous callers. This farm serves everything we can reach without "
+                "asking for a credential, so there is no authenticated connection to "
+                "establish and nothing for the POST to ride on. Point SP_NTLM_PRIME_URL "
+                "at a URL this account must log in for, if one exists. The "
                 "POST needs a credential the server is never asking for."
             ),
         )

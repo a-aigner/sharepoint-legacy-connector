@@ -371,6 +371,23 @@ def describe_auth_failure(response: requests.Response, *, auth_mode: str, userna
             "problem on this resource, not a wrong password."
         )
         lines.append("  check       : the account's permissions on this web, before SP_USERNAME")
+    elif auth_mode in ("ntlm", "integrated"):
+        # NTLM and Negotiate are challenge-response: the client sends nothing
+        # until the server asks. A 401 that carries no challenge therefore ends
+        # the exchange before it begins — the handshake is never started, and
+        # the server's own logs show the request arriving with no credentials.
+        # It looks like the client failing to authenticate; it is the server
+        # never inviting it to.
+        lines.append(
+            "  server says : refused WITHOUT a WWW-Authenticate challenge, so the handshake "
+            "never began. NTLM sends nothing until it is asked, and it was not asked — which "
+            "is why the server logs show this request arriving with no credentials."
+        )
+        lines.append(
+            "  check       : whether a bodyless GET to this same URL is challenged normally. "
+            "If it is, the endpoint only withholds the challenge from requests carrying a "
+            "body, and SP_NTLM_PRIME_CONNECTION is the workaround."
+        )
     else:
         lines.append("  server says : no WWW-Authenticate challenge")
         lines.append(f"  check       : SP_AUTH_MODE is '{auth_mode}' — the server wanted a credential")

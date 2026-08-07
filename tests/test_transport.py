@@ -763,3 +763,23 @@ def test_a_healthy_farm_pays_nothing_for_this(rsps, ntlm_tp: Transport) -> None:
     rsps.add(responses.POST, ENDPOINT, status=200, body="<ok/>")
     assert ntlm_tp.post_soap(ENDPOINT, b"<x/>", "op") == b"<ok/>"
     assert len(rsps.calls) == 1
+
+
+def test_a_401_with_no_challenge_to_ntlm_is_a_handshake_that_never_started() -> None:
+    """Matches what the farm's own server log shows: requests, but no credentials.
+
+    NTLM sends nothing until challenged. A 401 carrying no WWW-Authenticate
+    ends the exchange before it begins, so nothing the client does can put a
+    credential on the wire — and blaming SP_AUTH_MODE for "not attaching one"
+    points at the one thing that is configured correctly.
+    """
+    message = describe_auth_failure(a_401(sent_credential=False), auth_mode="ntlm", username="pkober")
+    assert "handshake never began" in message
+    assert "no credentials" in message
+    assert "SP_NTLM_PRIME_CONNECTION" in message
+    assert "the server wanted a credential" not in message
+
+
+def test_anonymous_mode_still_gets_the_plain_advice() -> None:
+    message = describe_auth_failure(a_401(sent_credential=False), auth_mode="anonymous", username="")
+    assert "SP_AUTH_MODE is 'anonymous'" in message

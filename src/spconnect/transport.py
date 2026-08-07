@@ -394,9 +394,12 @@ def describe_auth_failure(response: requests.Response, *, auth_mode: str, userna
                     "IIS has Extended Protection set to Required; turning it off then makes "
                     "matters strictly worse, and the fix is to present the right certificate "
                     "by reaching the web front end directly, or to have the admin relax "
-                    "Extended Protection to Accept. A client that sends no binding at all — "
-                    "curl --ntlm — is refused under Required too, so its failing proves "
-                    "nothing about this cause either way.",
+                    "Extended Protection to Accept. Two traps in testing this: a client that "
+                    "sends no binding at all — curl --ntlm — is refused under Required too, "
+                    "so its failing proves nothing either way; and the direct-route test "
+                    "must run with bindings ON, since with SP_NTLM_SEND_CBT=false left over "
+                    "from the previous test there is no binding to be validated and the "
+                    "right certificate cannot help.",
                     "    3. an LmCompatibilityLevel mismatch between this client, the web "
                     "front end and the domain controller.",
                     "    4. the account: wrong password, locked out, or not permitted to log "

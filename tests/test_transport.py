@@ -151,6 +151,9 @@ def test_a_completed_handshake_that_is_refused_does_not_blame_the_password_alone
     assert "Extended Protection set to Required" in message
     assert "strictly worse" in message
     assert "curl --ntlm" in message
+    # The direct-route test is worthless with bindings left switched off from the
+    # previous test: there is then no binding for the right certificate to validate.
+    assert "must run with bindings ON" in message
     # And the one thing that settles it, which is not on this machine.
     assert "sc-win32-status" in message
     assert "1326" in message

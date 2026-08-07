@@ -767,6 +767,11 @@ class Transport:
         #: Set by :meth:`probe_version`: the sign-in or access-denied page we were
         #: sent to instead of the site, if we were.
         self.version_probe_denied_by: str | None = None
+        #: Has any request in this session carried a credential and been served?
+        #: Recorded by :meth:`_authenticated`, and the only thing that separates a
+        #: connection NTLM has already authenticated from anonymous access — see
+        #: there for why one response cannot tell them apart.
+        self.credential_accepted = False
         self.request_count = 0
         self.bytes_received = 0
         #: Requests the diagnostics send outside :meth:`_send` — the auth probe,
@@ -941,14 +946,29 @@ class Transport:
     # ---- convenience wrappers ----
 
     def _authenticated(self, response: requests.Response) -> bool:
-        """Did this exchange actually put a credential on the wire?
+        """Did *this* exchange actually put a credential on the wire?
 
         A 2xx is not proof. Where SharePoint permits anonymous reads the request
         is served without anyone being asked for anything, leaving the
         connection exactly as unauthenticated as it was.
+
+        Records a yes in :attr:`credential_accepted`, which every caller reaches
+        for eventually. ``requests-ntlm`` attaches ``Authorization`` only inside
+        its 401 retry path, so once a handshake has completed, every later
+        request on that connection goes out **bare** and is served anyway — NTLM
+        authenticated the socket, not the request. That response is identical to
+        an anonymously served one, and a session that has negotiated at least
+        once is the only remaining evidence of which it is.
+
+        Recording an *acceptance* rather than merely an attempt is sound because
+        every caller asks this after the 401/403 gate: a request that carried a
+        credential and got this far was not refused.
         """
         headers = getattr(response.request, "headers", {}) or {}
-        return "authorization" in {k.lower() for k in headers}
+        if "authorization" not in {k.lower() for k in headers}:
+            return False
+        self.credential_accepted = True
+        return True
 
     def _prime_attempt(self, method: str, endpoint: str, **kwargs: Any) -> bool | None:
         """One priming attempt. ``True`` primed, ``False`` refused, ``None`` inconclusive."""
@@ -977,6 +997,21 @@ class Transport:
         if self._authenticated(response):
             log.info("ntlm_prime", method=method, endpoint=endpoint, status=response.status_code, primed=True)
             return True
+        if self.credential_accepted:
+            # Bare, unchallenged, and served — on a session whose credential has
+            # already been accepted once. That is a connection NTLM authenticated
+            # earlier and IIS is still honouring, which is precisely the state
+            # priming exists to reach. Reading it as anonymous access instead
+            # threw away a working connection and blamed the farm for it.
+            log.info(
+                "ntlm_prime",
+                method=method,
+                endpoint=endpoint,
+                status=response.status_code,
+                primed=True,
+                detail="served on a connection authenticated earlier in this session",
+            )
+            return True
         log.debug("ntlm_prime.anonymous", method=method, endpoint=endpoint, status=response.status_code)
         return None
 
@@ -1000,9 +1035,17 @@ class Transport:
         2. **A bodyless GET**, for farms that answer a contentless POST oddly.
 
         Either way the credential must actually be exercised: a request served
-        anonymously proves nothing and primes nothing. And a refusal stops the
-        whole thing — retrying then would spend a second failed authentication
-        against an account that may have a lockout policy.
+        anonymously proves nothing and primes nothing.
+
+        A refusal does **not** end the ladder, though it used to. A 401 on the
+        contentless POST is ambiguous: a rejected credential and a handshake torn
+        onto a fresh socket produce byte-identical responses — challenge present,
+        Type 3 already sent — so no heuristic on that response can separate them.
+        The bodyless GET can, because it carries no body for IIS to tear the
+        connection down over. Declining to send it to save one failed logon left
+        exactly the farms this workaround exists for unreadable, which is the
+        worse trade. Two attempts remains the ceiling, so a refused GET is the
+        end of it.
         """
         attempts: list[tuple[str, dict[str, Any]]] = []
         if soap_action is not None:
@@ -1020,12 +1063,28 @@ class Transport:
             )
         attempts.append(("GET", {}))
 
+        refused = False
         for method, kwargs in attempts:
             outcome = self._prime_attempt(method, endpoint, **kwargs)
             if outcome is True:
                 return True
             if outcome is False:
-                return False  # refused outright: do not spend another attempt
+                refused = True
+
+        if refused:
+            # Worth separating from the case below: "refused" and "never asked"
+            # send the operator to opposite ends of the farm, and the last
+            # attempt was a GET, which cannot have been broken by a body.
+            log.warning(
+                "ntlm_prime.refused",
+                endpoint=endpoint,
+                detail=(
+                    "every priming attempt was refused, the bodyless GET included. A GET "
+                    "gives IIS no body to tear the connection down over, so this reads as "
+                    "the credential being turned down rather than the handshake breaking."
+                ),
+            )
+            return False
 
         log.warning(
             "ntlm_prime.anonymous",
@@ -1311,9 +1370,7 @@ class Transport:
         # request simply being allowed through. "login successful" asserted from
         # a 2xx alone is a false green: anonymous-readable farms, and redirects
         # to pages that need no login, both produce one without authenticating.
-        self.version_probe_authenticated = "authorization" in {
-            k.lower() for k in (getattr(response.request, "headers", {}) or {})
-        }
+        self.version_probe_authenticated = self._authenticated(response)
 
         raw = response.headers.get(VERSION_HEADER)
         major = None

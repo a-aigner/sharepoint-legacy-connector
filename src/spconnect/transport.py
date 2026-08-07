@@ -387,9 +387,16 @@ def describe_auth_failure(response: requests.Response, *, auth_mode: str, userna
                     "balancer without session persistence, or a reverse proxy with "
                     "inconsistent IP passthrough, breaks this while leaving every single "
                     "GET working.",
-                    "    2. channel bindings: on https the client binds the response to the "
-                    "certificate it sees, which is the wrong one where TLS is terminated by "
-                    "a proxy. Try SP_NTLM_SEND_CBT=false.",
+                    "    2. channel bindings, which fail in two opposite directions. The "
+                    "binding is WRONG where TLS is terminated by a proxy, because we bind to "
+                    "the certificate we see rather than the one the server expects — try "
+                    "SP_NTLM_SEND_CBT=false. Or the binding is MISSING and required, where "
+                    "IIS has Extended Protection set to Required; turning it off then makes "
+                    "matters strictly worse, and the fix is to present the right certificate "
+                    "by reaching the web front end directly, or to have the admin relax "
+                    "Extended Protection to Accept. A client that sends no binding at all — "
+                    "curl --ntlm — is refused under Required too, so its failing proves "
+                    "nothing about this cause either way.",
                     "    3. an LmCompatibilityLevel mismatch between this client, the web "
                     "front end and the domain controller.",
                     "    4. the account: wrong password, locked out, or not permitted to log "

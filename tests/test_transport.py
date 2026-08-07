@@ -142,8 +142,15 @@ def test_a_completed_handshake_that_is_refused_does_not_blame_the_password_alone
 
     assert "three-leg handshake COMPLETED" in message
     assert "load balancer without session persistence" in message
-    assert "SP_NTLM_SEND_CBT=false" in message
     assert "LmCompatibilityLevel" in message
+    # Channel bindings fail in two opposite directions and only one is fixed by
+    # switching them off. Under Extended Protection = Required, off is worse — and a
+    # client that sends none, like curl --ntlm, is refused for that reason alone, so
+    # its failing is not evidence against this cause.
+    assert "SP_NTLM_SEND_CBT=false" in message
+    assert "Extended Protection set to Required" in message
+    assert "strictly worse" in message
+    assert "curl --ntlm" in message
     # And the one thing that settles it, which is not on this machine.
     assert "sc-win32-status" in message
     assert "1326" in message

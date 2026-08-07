@@ -412,7 +412,7 @@ class Crawler:
                 # No entity set means no REST path for this list. Falling back is
                 # strictly better than skipping it.
                 self.report.warnings.append(
-                    f"{list_info.title}: no ListData.svc entity set found; used SOAP for this list"
+                    f"{list_info.title}: no ListData.svc collection found; used SOAP for this list"
                 )
                 self.report.odata_fallbacks.append(f"{list_info.web_url} :: {list_info.title}")
             else:

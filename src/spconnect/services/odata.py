@@ -380,7 +380,11 @@ class ODataService:
         the content type we asked for.
         """
         if self._entity_sets is None:
-            url = self.endpoint + "/"
+            # Bare `…/ListData.svc`, with no trailing slash and nothing appended.
+            # The slash is optional in the OData spec and not free in practice:
+            # IIS of this vintage can treat `ListData.svc/` as a path below the
+            # handler and answer 404 for a service that is running perfectly well.
+            url = self.endpoint
             response = self._get(url, accept=_ACCEPT_SERVICE_DOCUMENT)
             if self._is_json(response):
                 self.representation = "json"
@@ -390,7 +394,7 @@ class ODataService:
                 names = self._service_document_atom(response)
             if not names:
                 raise ODataUnavailable(
-                    f"{url} answered, but named no entity sets "
+                    f"{url} answered, but named no collections "
                     f"({response.headers.get('Content-Type')}); "
                     f"first 200 bytes: {response.content[:200]!r}\n"
                     "  A 404 would mean the feature is not installed. This is something "
@@ -428,7 +432,7 @@ class ODataService:
         document mixes the ``app`` and ``atom`` namespaces and older builds
         disagree about which one is the default.
         """
-        root = self._parse_atom(self.endpoint + "/", response)
+        root = self._parse_atom(self.endpoint, response)
         return [href for c in find_all(root, "collection") if (href := c.get("href"))]
 
     def available(self) -> tuple[bool, str | None]:
@@ -437,7 +441,7 @@ class ODataService:
             sets = self.entity_sets()
         except Exception as exc:
             return False, str(exc)
-        return True, f"{len(sets)} entity sets"
+        return True, f"{len(sets)} collection(s)"
 
     def entity_set_for(self, list_title: str) -> str | None:
         """Map a list title to its entity-set name via the service document.

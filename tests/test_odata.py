@@ -106,7 +106,7 @@ def test_entity_set_lookup_reports_a_miss_rather_than_guessing(service: ODataSer
 def test_availability_probe_never_raises(service: ODataService, farm: FakeFarm) -> None:
     ok, detail = service.available()
     assert ok is True
-    assert "4 entity sets" in detail
+    assert "4 collection(s)" in detail
 
     farm.odata_broken = "odata_not_available.html"
     broken = ODataService(service.transport, WEB1)
@@ -143,6 +143,19 @@ def test_html_body_with_a_200_is_not_mistaken_for_either_format(
 # definition and whether a given WCF Data Services build will emit JSON for it is
 # version-dependent — SharePoint 2010's need not.
 # --------------------------------------------------------------------------- #
+
+
+def test_the_service_document_is_asked_for_by_its_bare_url(farm: FakeFarm, transport: Transport) -> None:
+    """`…/ListData.svc`, with no trailing slash and nothing appended.
+
+    The slash is optional in the OData spec and not free in practice: IIS of this
+    vintage can read `ListData.svc/` as a path *below* the handler and answer 404
+    for a service that is running perfectly well.
+    """
+    ODataService(transport, WEB1).entity_sets()
+
+    roots = [u for u in farm.odata_requests if "ListData.svc" in u]
+    assert roots == [f"{WEB1}/_vti_bin/ListData.svc"]
 
 
 def test_the_service_document_is_read_as_atom(farm: FakeFarm, transport: Transport) -> None:

@@ -711,7 +711,7 @@ def probe_rest(
             try:
                 sets = service.entity_sets()
                 rest = "ok"
-                st.detail(f"{len(sets)} entity sets, served as {service.representation}")
+                st.detail(f"{len(sets)} collection(s), served as {service.representation}")
             except AuthenticationError as exc:
                 # Recorded, not raised: a refused GET is exactly the measurement
                 # this command came for.
@@ -738,7 +738,7 @@ def probe_rest(
             if rest != "ok":
                 st.detail("skipped — ListData.svc did not answer")
             elif not sets and entity_set is None:
-                st.detail("no entity sets exposed")
+                st.detail("no collections exposed")
             else:
                 chosen, rows, skipped = _first_readable_collection(service, sets, override=entity_set)
                 if chosen is None:
@@ -1263,7 +1263,7 @@ def _entity_set_mapping(context: Context, web_url: str) -> list[str]:
         if not entity:
             unmapped.append(info.title)
     if unmapped:
-        lines.append(f"{len(unmapped)} list(s) have no REST entity set; those fall back to SOAP.")
+        lines.append(f"{len(unmapped)} list(s) have no REST collection; those fall back to SOAP.")
     return lines
 
 

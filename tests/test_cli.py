@@ -720,7 +720,7 @@ def test_probe_rest_succeeds_when_both_backends_work(env_file: Path, farm: FakeF
     result = run(env_file, "probe-rest")
 
     assert result.exit_code == 0
-    assert "entity sets" in result.stdout
+    assert "collection(s), served as" in result.stdout
     assert "REST ok, SOAP ok" in result.stdout
     assert "Both work" in result.stdout
 

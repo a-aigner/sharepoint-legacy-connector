@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 import sys
 from collections.abc import Mapping, MutableMapping
 from pathlib import Path
@@ -269,6 +270,39 @@ def load_settings(
     if overrides:
         kwargs.update({k: v for k, v in overrides.items() if v is not None})
     return Settings(**kwargs)
+
+
+def unknown_settings(env_file: str | Path | None = None) -> list[str]:
+    """``SP_*`` names that look like settings and are not, with where each came from.
+
+    ``extra="ignore"`` is right for the model — an unrelated ``SP_`` variable in a
+    shell must not stop a crawl — but it means a typo, or a setting from a newer
+    version than the one installed, is discarded in **silence**. An operator
+    toggling a flag on a customer site then reads "the flag did not help" from a run
+    where the flag was never applied, which is the same false conclusion as every
+    other quiet default this connector has had to grow a warning for.
+
+    Read-only and best-effort: the point is to say "you set something we ignored",
+    not to parse dotenv exactly.
+    """
+    known = {f"SP_{name.upper()}" for name in Settings.model_fields}
+    seen: dict[str, str] = {}
+
+    path = Path(env_file) if env_file is not None else Path(".env")
+    if path.is_file():
+        for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key = line.split("=", 1)[0].strip().lstrip("export ").strip().upper()
+            if key.startswith("SP_"):
+                seen[key] = str(path)
+
+    for key in os.environ:
+        if key.upper().startswith("SP_"):
+            seen.setdefault(key.upper(), "environment")
+
+    return [f"{key} (from {source})" for key, source in sorted(seen.items()) if key not in known]
 
 
 def setup_logging(level: str = "INFO", fmt: LogFormat = "console") -> None:

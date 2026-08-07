@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from spconnect.config import REDACTED, Settings, load_settings
+from spconnect.config import REDACTED, Settings, load_settings, unknown_settings
 
 ENV_TEXT = """
 SP_BASE_URL=http://sharepoint.intern.example.de/
@@ -126,3 +126,53 @@ def test_invalid_auth_mode_is_rejected() -> None:
 def test_invalid_concurrency_is_rejected() -> None:
     with pytest.raises(ValueError):
         Settings(_env_file=None, concurrency=0)
+
+
+# --------------------------------------------------------------------------- #
+# settings that were set and silently ignored
+# --------------------------------------------------------------------------- #
+
+
+def test_a_misspelt_setting_is_reported_rather_than_swallowed(tmp_path: Path) -> None:
+    """`extra="ignore"` is right for the model and wrong to stay quiet about.
+
+    An operator toggling a flag on a customer site otherwise reads "the flag did
+    not help" from a run where the flag was never applied. Those two look identical
+    in the output and call for completely different next moves.
+    """
+    path = tmp_path / ".env"
+    path.write_text(
+        "SP_BASE_URL=http://sp\nSP_NTLM_SEND_CBT=false\nSP_NTLM_SEND_CTB=false\n", encoding="utf-8"
+    )
+
+    reported = unknown_settings(path)
+
+    assert any("SP_NTLM_SEND_CTB" in line for line in reported), "the transposed name is flagged"
+    assert not any("SP_NTLM_SEND_CBT" in line and "CTB" not in line for line in reported)
+    assert not any("SP_BASE_URL" in line for line in reported)
+    assert str(path) in reported[0], "and where it came from, since .env and shell both count"
+
+
+def test_comments_and_blank_lines_are_not_settings(tmp_path: Path) -> None:
+    path = tmp_path / ".env"
+    path.write_text("# SP_NOT_REAL=1\n\nSP_BASE_URL=http://sp\n", encoding="utf-8")
+    assert unknown_settings(path) == []
+
+
+def test_an_unknown_setting_in_the_environment_is_reported_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SP_MADE_UP_FLAG", "1")
+    path = tmp_path / ".env"
+    path.write_text("SP_BASE_URL=http://sp\n", encoding="utf-8")
+
+    reported = unknown_settings(path)
+
+    assert any("SP_MADE_UP_FLAG" in line and "environment" in line for line in reported)
+
+
+def test_every_real_setting_passes_the_check(tmp_path: Path) -> None:
+    """A false positive here would train an operator to ignore the warning."""
+    path = tmp_path / ".env"
+    path.write_text("".join(f"SP_{name.upper()}=x\n" for name in Settings.model_fields), encoding="utf-8")
+    assert unknown_settings(path) == []

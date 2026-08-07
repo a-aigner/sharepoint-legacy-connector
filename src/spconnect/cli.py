@@ -15,7 +15,7 @@ from typing import Annotated, Any
 import typer
 
 from . import __version__
-from .config import Settings, get_logger, load_settings, setup_logging
+from .config import Settings, get_logger, load_settings, setup_logging, unknown_settings
 from .console import StepReporter, format_bytes
 from .crawl import LIST_VIEW_THRESHOLD, THRESHOLD_ADVICE, CrawlAborted, Crawler, RunReport
 from .landing import LandingZone
@@ -208,6 +208,16 @@ def main(
         # An overridden landing zone takes its state file with it.
         settings.state_file = Path(landing_dir) / "_state.json"
     setup_logging(settings.log_level, settings.log_format)
+    for setting in unknown_settings(env_file):
+        # Loud, and before any step narration: a silently dropped flag turns the
+        # next run into evidence about a setting that was never applied.
+        log.warning(
+            "config.unknown_setting",
+            setting=setting,
+            detail="not a setting this version knows, so it was IGNORED. Check the "
+            "spelling against docs/configuration.md, and that this build is new "
+            "enough to have it.",
+        )
     ctx.obj = Context(settings, dry_run)
 
 
@@ -318,6 +328,15 @@ def probe(ctx: typer.Context) -> None:
         f"legacy TLS  : {'on' if settings.allow_legacy_tls else 'off'}, "
         f"verify SSL {'on' if settings.verify_ssl else 'off'}"
     )
+    if settings.auth_mode in ("ntlm", "integrated"):
+        # Printed so a toggled flag is visibly in effect. "The flag did not work"
+        # and "the flag did not help" look identical in the output otherwise, and
+        # they call for completely different next moves.
+        steps.info(
+            f"ntlm        : channel bindings {'on' if settings.ntlm_send_cbt else 'OFF'}, "
+            f"priming {'on' if settings.ntlm_prime_connection else 'off'}"
+            + (f", prime URL {settings.ntlm_prime_url}" if settings.ntlm_prime_url else "")
+        )
     steps.info(f"rate limit  : {settings.requests_per_second}/s")
     if settings.log_bodies:
         steps.info(f"body trace  : {settings.resolved_trace_file} (mode 0600)")

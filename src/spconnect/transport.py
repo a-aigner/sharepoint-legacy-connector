@@ -1183,9 +1183,14 @@ class Transport:
                 "ntlm_prime.refused",
                 endpoint=endpoint,
                 detail=(
-                    "every priming attempt was refused, the bodyless GET included. A GET "
-                    "gives IIS no body to tear the connection down over, so this reads as "
-                    "the credential being turned down rather than the handshake breaking."
+                    "every priming attempt was refused, a bodyless GET included. That rules "
+                    "the request body OUT — a GET gives IIS nothing to tear the connection "
+                    "down over — so the POST is not the problem and neither is priming. It "
+                    "does NOT single out the password: a challenge and response reaching "
+                    "different servers or client IPs, channel bindings under a "
+                    "TLS-terminating proxy, and an LmCompatibilityLevel mismatch all refuse "
+                    "a bodyless handshake in exactly the same way. See the four causes on "
+                    "the failing step, and settle it with the IIS log's sc-win32-status."
                 ),
             )
             return False

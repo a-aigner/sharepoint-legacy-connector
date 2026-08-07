@@ -111,8 +111,9 @@ gives IIS no body to close the connection over. If the GET is refused too, the
 credential really is being turned down, and no second POST is attempted:
 
 ```
-[warning] ntlm_prime.refused  every priming attempt was refused, the bodyless GET
-                              included … reads as the credential being turned down
+[warning] ntlm_prime.refused  every priming attempt was refused, a bodyless GET
+                              included … rules the request body OUT, but does NOT
+                              single out the password
                               rather than the handshake breaking
 ```
 

@@ -333,6 +333,37 @@ def test_done_names_the_failed_steps(capsys) -> None:
     assert "1 step(s) FAILED" in capsys.readouterr().out
 
 
+def test_an_early_failure_says_which_steps_never_ran(capsys) -> None:
+    """A run that stopped at step 2 gets read as evidence about step 5.
+
+    That is worse than useless while a setting is being tested: the operator
+    concludes the flag did not help, from a run that never reached the code the flag
+    controls. It happened — a scheme change failed the base-URL check at step 2 and
+    the NTLM option under test was never exercised.
+    """
+    reporter = StepReporter(total=8)
+    with reporter.step("First"):
+        pass
+    with pytest.raises(RuntimeError), reporter.step("Second"):
+        raise RuntimeError("redirected")
+    reporter.done()
+
+    out = capsys.readouterr().out
+    assert "Steps 3-8 never ran" in out
+    assert "including any setting they would have exercised" in out
+
+
+def test_a_failure_on_the_last_step_claims_nothing_was_skipped(capsys) -> None:
+    reporter = StepReporter(total=2)
+    with reporter.step("First"):
+        pass
+    with pytest.raises(RuntimeError), reporter.step("Second"):
+        raise RuntimeError("x")
+    reporter.done()
+
+    assert "never ran" not in capsys.readouterr().out
+
+
 @pytest.mark.parametrize(
     ("count", "expected"), [(512, "512 B"), (2048, "2.0 KB"), (5 * 1024 * 1024, "5.0 MB")]
 )

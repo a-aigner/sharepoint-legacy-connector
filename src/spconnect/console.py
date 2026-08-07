@@ -117,6 +117,16 @@ class StepReporter:
         self._echo("")
         if self.failed:
             self._echo(f"{len(self.failed)} step(s) FAILED in {elapsed:.2f}s: {', '.join(self.failed)}")
+            if self.total and self.index < self.total:
+                # An early failure masks everything after it, and a run that stopped
+                # at step 2 is routinely read as evidence about step 5. It is worse
+                # than useless when a setting is being tested: the operator concludes
+                # the flag did not help, from a run that never reached the code the
+                # flag controls.
+                self._echo(
+                    f"Steps {self.index + 1}-{self.total} never ran, so this run says "
+                    "nothing about them — including any setting they would have exercised."
+                )
         else:
             self._echo(message or f"All steps OK in {elapsed:.2f}s")
 

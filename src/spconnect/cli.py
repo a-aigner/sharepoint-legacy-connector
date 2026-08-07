@@ -22,7 +22,7 @@ from .models import ListSchema
 from .permissions import probe_access
 from .schema import graph_summary, render_dot, render_mermaid
 from .services.lists import ListsService, is_system_list
-from .services.odata import ODataService
+from .services.odata import ODataService, ODataUnavailable
 from .services.sitedata import SiteDataService
 from .services.usergroup import UserGroupService
 from .services.webs import WebsService
@@ -457,7 +457,10 @@ def probe_rest(ctx: typer.Context) -> None:
     echo("")
 
     auth: AuthProbe | None = None
-    rest_ok = False
+    #: "ok" | "denied" | "absent" | "error". Why REST failed decides whether it
+    #: can serve as a control at all: a 404 means the feature is not installed,
+    #: which says nothing about the credential and makes the comparison void.
+    rest = "error"
     soap_ok = False
     soap_detail = ""
 
@@ -470,28 +473,44 @@ def probe_rest(ctx: typer.Context) -> None:
             st.detail(f"HTTP {auth.status} — {auth.advice}")
 
         service = ODataService(context.transport, settings.base_url)
+        sets: list[str] = []
 
         with steps.step("Reach ListData.svc (a GET, not a SOAP POST)") as st:
-            ok, detail = service.available()
-            rest_ok = ok
-            st.detail(str(detail) if ok else "unavailable")
-            if not ok:
-                st.note(str(detail))
+            try:
+                sets = service.entity_sets()
+                rest = "ok"
+                st.detail(f"{len(sets)} entity sets")
+            except AuthenticationError as exc:
+                # Recorded, not raised: a refused GET is exactly the measurement
+                # this command came for.
+                rest = "denied"
+                st.ok = False
+                st.note(f"refused: {str(exc).splitlines()[0]}")
+            except ODataUnavailable as exc:
+                rest = "absent"
+                st.ok = False
+                st.note(str(exc).splitlines()[0])
+                st.note(
+                    "This is the feature missing, not the credential being refused — "
+                    "ListData.svc needs WCF Data Services on the farm."
+                )
+            except Exception as exc:
+                rest = "error"
+                st.ok = False
+                st.note(f"{type(exc).__name__}: {str(exc).splitlines()[0]}")
 
         with steps.step("Read one row over REST") as st:
-            if not rest_ok:
-                st.detail("skipped — ListData.svc is not answering")
+            if rest != "ok":
+                st.detail("skipped — ListData.svc did not answer")
+            elif not sets:
+                st.detail("no entity sets exposed")
             else:
-                sets = service.entity_sets()
-                if not sets:
-                    st.detail("no entity sets exposed")
-                else:
-                    page = service.get_items(sets[0], top=1)
-                    st.detail(f"{sets[0]}: {len(page.rows)} row(s)")
-                    for name in sets[:10]:
-                        st.note(f"- {name}")
-                    if len(sets) > 10:
-                        st.note(f"… and {len(sets) - 10} more")
+                page = service.get_items(sets[0], top=1)
+                st.detail(f"{sets[0]}: {len(page.rows)} row(s)")
+                for name in sets[:10]:
+                    st.note(f"- {name}")
+                if len(sets) > 10:
+                    st.note(f"… and {len(sets) - 10} more")
 
         with steps.step("Same web and credential, via SOAP (a POST)") as st:
             # Deliberately not fatal, and not counted as a failed step: a SOAP
@@ -508,8 +527,8 @@ def probe_rest(ctx: typer.Context) -> None:
                 st.note(soap_detail)
 
         with steps.step("Verdict") as st:
-            st.detail(f"REST {'ok' if rest_ok else 'failed'}, SOAP {'ok' if soap_ok else 'failed'}")
-            for line in _rest_vs_soap_verdict(rest_ok, soap_ok):
+            st.detail(f"REST {rest}, SOAP {'ok' if soap_ok else 'failed'}")
+            for line in _rest_vs_soap_verdict(rest, soap_ok):
                 st.note(line)
 
     except AuthenticationError as exc:
@@ -532,18 +551,25 @@ def probe_rest(ctx: typer.Context) -> None:
         )
         context.close()
 
-    steps.done("REST reachable." if rest_ok else "REST NOT reachable.")
-    raise typer.Exit(0 if rest_ok else 1)
+    steps.done("REST reachable." if rest == "ok" else f"REST NOT reachable ({rest}).")
+    raise typer.Exit(0 if rest == "ok" else 1)
 
 
-def _rest_vs_soap_verdict(rest_ok: bool, soap_ok: bool) -> list[str]:
-    """What the two results together mean. The contrast is the whole point."""
-    if rest_ok and soap_ok:
+def _rest_vs_soap_verdict(rest: str, soap_ok: bool) -> list[str]:
+    """What the two results together mean.
+
+    ``rest`` is *why* REST failed, not merely whether. A 404 means the feature
+    is not installed on the farm, which says nothing about the credential and
+    leaves this comparison with no control — reporting that as "both were
+    refused, so it is not the method" would be a conclusion drawn from a test
+    that never ran.
+    """
+    if rest == "ok" and soap_ok:
         return [
             "Both work. Nothing is isolated here — whatever failed elsewhere is not",
             "about REST versus SOAP.",
         ]
-    if rest_ok and not soap_ok:
+    if rest == "ok" and not soap_ok:
         return [
             "REST GET succeeds where the SOAP POST fails, on the same _vti_bin",
             "directory with the same credential. The account and the location are",
@@ -555,15 +581,33 @@ def _rest_vs_soap_verdict(rest_ok: bool, soap_ok: bool) -> list[str]:
             "NOTE: this does NOT unblock a crawl. SP_API_MODE=odata changes only",
             "where *items* come from; web and list discovery still go over SOAP.",
         ]
-    if not rest_ok and soap_ok:
+    if soap_ok:
+        # SOAP is the backend that matters; REST being absent costs nothing.
         return [
             "SOAP works and REST does not — the OData feature is off, or this build",
             "predates ListData.svc. Keep SP_API_MODE=soap; nothing is wrong.",
         ]
+    if rest == "denied":
+        return [
+            "Both were refused, GET and POST alike, on the same directory. The",
+            "request method is therefore not the problem: this is the credential's",
+            "access to this web, or _vti_bin being restricted on this zone.",
+            "`spconnect permissions` next.",
+        ]
+    if rest == "absent":
+        return [
+            "INCONCLUSIVE. ListData.svc is not installed on this farm, so it never",
+            "got as far as accepting or refusing the credential — there is no",
+            "control here, and nothing about the SOAP failure follows from it.",
+            "A 404 is the feature missing, not the account being denied.",
+            "Use the differential check in `spconnect probe` instead: it compares a",
+            "bodyless GET against the POST on the very same .asmx endpoint, and",
+            "needs no extra farm components.",
+        ]
     return [
-        "Both fail the same way, so the failure is not about the request method.",
-        "That points at the credential's access to this web, or at _vti_bin being",
-        "restricted on this zone — not at SOAP. `spconnect permissions` next.",
+        "REST could not be reached for an unrelated reason, so it proves nothing",
+        "about the SOAP failure. Fall back to the differential check in",
+        "`spconnect probe`.",
     ]
 
 

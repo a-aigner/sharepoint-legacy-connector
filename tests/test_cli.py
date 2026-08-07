@@ -494,20 +494,42 @@ def test_probe_rest_says_when_odata_is_simply_off(env_file: Path, farm: FakeFarm
     result = run(env_file, "probe-rest")
 
     assert result.exit_code == 1
-    assert "REST failed, SOAP ok" in result.stdout
+    assert "REST absent, SOAP ok" in result.stdout
     assert "Keep SP_API_MODE=soap" in result.stdout
 
 
-def test_probe_rest_does_not_blame_the_method_when_both_fail(env_file: Path, farm: FakeFarm) -> None:
-    farm.odata_broken = "odata_not_available.html"
+def test_a_missing_odata_feature_proves_nothing_about_a_soap_failure(env_file: Path, farm: FakeFarm) -> None:
+    """The reported farm: ListData.svc 404s and the SOAP POST 401s.
+
+    A 404 is the feature not being installed. It never reached the point of
+    accepting or refusing the credential, so there is no control and no
+    conclusion — calling this "both were refused, so it is not the method"
+    would be a finding from a test that never ran.
+    """
+    farm.odata_broken = "odata_not_available.html"  # 404
     farm.fail_on["GetAllSubWebCollection"] = AuthenticationError("HTTP 401")
     farm.always_fail["GetWebCollection"] = "html_login_page.html"
 
     result = run(env_file, "probe-rest")
 
     assert result.exit_code == 1
-    assert "REST failed, SOAP failed" in result.stdout
-    assert "not about the request method" in result.stdout
+    assert "REST absent, SOAP failed" in result.stdout
+    assert "INCONCLUSIVE" in result.stdout
+    assert "not the account being denied" in result.stdout
+    assert "not the problem" not in result.stdout
+
+
+def test_rest_and_soap_both_refused_does_rule_out_the_method(env_file: Path, farm: FakeFarm) -> None:
+    """A 401 from REST is a real refusal, unlike a 404, so the contrast holds."""
+    farm.odata_broken = "odata_not_available.html"
+    farm.odata_broken_status = 401
+    farm.fail_on["GetAllSubWebCollection"] = AuthenticationError("HTTP 401")
+    farm.always_fail["GetWebCollection"] = "html_login_page.html"
+
+    result = run(env_file, "probe-rest")
+
+    assert "REST denied, SOAP failed" in result.stdout
+    assert "request method is therefore not the problem" in result.stdout
 
 
 def test_probe_rest_stops_on_a_redirecting_base_url(tmp_path: Path, mocked_responses) -> None:

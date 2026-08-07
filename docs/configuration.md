@@ -37,6 +37,7 @@ Load a different file with `--env-file /path/to/other.env`.
 |---|---|---|---|
 | `SP_ALLOW_LEGACY_TLS` | bool | `True` | Permit TLS 1.0 and `DEFAULT@SECLEVEL=0` ciphers. **https only** — irrelevant over plain HTTP. Logs a warning when active. |
 | `SP_VERIFY_SSL` | bool | `False` | Certificate verification. Off by default because these farms usually have self-signed certs. |
+| `SP_NTLM_PRIME_CONNECTION` | bool | `True` | Retry a 401'd SOAP POST once on a connection authenticated by a bodyless GET. Only fires when the GET succeeds where the POST failed, so it never spends a second attempt on a genuinely bad credential. See [troubleshooting](troubleshooting.md). |
 | `SP_TIMEOUT_SECONDS` | float | `120.0` | Per-request timeout. |
 | `SP_MAX_RETRIES` | int | `5` | Attempts for retryable failures (5xx, timeouts, connection resets). Never applied to 401/403/404 or SOAP faults. |
 | `SP_BACKOFF_BASE_SECONDS` | float | `2.0` | Exponential backoff multiplier, capped at 120s. |

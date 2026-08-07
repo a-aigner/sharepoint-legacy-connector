@@ -901,17 +901,68 @@ class Transport:
 
     # ---- convenience wrappers ----
 
-    def post_soap(self, endpoint: str, body: bytes, soap_action: str) -> bytes:
+    def _prime_connection(self, endpoint: str) -> bool:
+        """Complete an NTLM handshake with a bodyless GET. ``True`` if it worked.
+
+        NTLM authenticates the TCP connection, not the request. IIS routinely
+        closes that connection when it rejects a request carrying a body, so the
+        three handshake legs land on different sockets and the POST can never
+        succeed — while a GET to the very same URL sails through.
+
+        Doing the handshake on a GET leaves the pooled connection authenticated,
+        and the POST that follows needs no handshake at all.
+
+        The GET result is also the safety check. If it is refused too, the
+        credential is genuinely being rejected and retrying the POST would only
+        spend a second failed authentication against an account that may have a
+        lockout policy.
+        """
+        try:
+            self.limiter.acquire()
+            self.side_channel_requests += 1
+            response = self.session.get(
+                endpoint, timeout=self.settings.timeout_seconds, allow_redirects=False
+            )
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            log.debug("ntlm_prime.failed", endpoint=endpoint, error=str(exc))
+            return False
+        ok = response.status_code < 400
+        log.info("ntlm_prime", endpoint=endpoint, status=response.status_code, primed=ok)
+        return ok
+
+    def post_soap(self, endpoint: str, body: bytes, soap_action: str, *, _primed: bool = False) -> bytes:
         """POST a SOAP envelope. Returns raw bytes; fault parsing lives in :mod:`soap`.
 
         Redirects are refused rather than followed: see :class:`SoapRedirectError`
         for why following one turns a SOAP call into an unrelated HTML page.
+
+        A 401 gets one retry behind :meth:`_prime_connection`, and only when a
+        bodyless GET to the same endpoint proves the credential is accepted
+        there — see that method for why the POST alone can fail.
         """
         headers = {
             "Content-Type": "text/xml; charset=utf-8",
             "SOAPAction": f'"{soap_action}"',
         }
-        response = self.request("POST", endpoint, data=body, headers=headers, allow_redirects=False)
+        try:
+            response = self.request("POST", endpoint, data=body, headers=headers, allow_redirects=False)
+        except AuthenticationError:
+            eligible = (
+                not _primed
+                and self.settings.ntlm_prime_connection
+                and self.settings.auth_mode in ("ntlm", "integrated")
+            )
+            if not eligible or not self._prime_connection(endpoint):
+                raise
+            log.warning(
+                "ntlm_prime.retry",
+                endpoint=endpoint,
+                detail=(
+                    "the POST was refused but a bodyless GET to the same endpoint was not; "
+                    "retrying the POST on the connection that GET authenticated"
+                ),
+            )
+            return self.post_soap(endpoint, body, soap_action, _primed=True)
         if response.status_code in REDIRECT_STATUS:
             location = response.headers.get("Location", "<no Location header>")
             log.error("soap.redirected", endpoint=endpoint, status=response.status_code, location=location)

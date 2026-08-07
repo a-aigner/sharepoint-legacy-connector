@@ -114,6 +114,12 @@ class Settings(BaseSettings):
     # ---- Transport quirks ----
     allow_legacy_tls: bool = True
     verify_ssl: bool = False
+    #: Recover from farms where a SOAP POST is refused but a bodyless GET to the
+    #: same endpoint is not. NTLM authenticates a *connection*, and IIS commonly
+    #: drops that connection when it 401s a request carrying a body, which fails
+    #: the handshake for POSTs while leaving GETs working. Priming the connection
+    #: with a GET first gets the handshake done where it can succeed.
+    ntlm_prime_connection: bool = True
     timeout_seconds: float = 120.0
     max_retries: int = 5
     backoff_base_seconds: float = 2.0

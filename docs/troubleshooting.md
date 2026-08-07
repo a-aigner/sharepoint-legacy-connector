@@ -67,6 +67,46 @@ Note that some farms rewrite the *path* while redirecting
 connector's advice keeps your existing path and changes only the scheme and
 host, which is what `SP_BASE_URL` wants.
 
+### Every SOAP POST is 401, but a GET to the same URL is fine
+
+The tell: `spconnect probe` fails at "Enumerate webs", and the differential
+underneath it shows the bodyless GETs succeeding:
+
+```
+Differential check (the POST failed — do bodyless GETs?):
+  GET https://sp.example.de                    -> HTTP 302
+  GET https://sp.example.de/_vti_bin/Webs.asmx -> HTTP 200
+```
+
+Open that second URL in a browser as the same account. If it renders the ASMX
+service-description page, the account and the endpoint are both fine and the
+**request itself** is what is being refused.
+
+**Why.** NTLM authenticates a *connection*, not a request, and the handshake
+takes three round trips. IIS commonly closes the connection when it rejects a
+request that carried a body, so the three legs land on different sockets and
+the handshake can never complete — while a bodyless GET to the same URL sails
+through.
+
+**What the connector does.** `SP_NTLM_PRIME_CONNECTION` (on by default) retries
+a 401'd POST once, on a connection an ordinary GET has just authenticated:
+
+```
+[info]    ntlm_prime        endpoint=…/Webs.asmx primed=True status=200
+[warning] ntlm_prime.retry  the POST was refused but a bodyless GET to the same
+                            endpoint was not; retrying the POST on the connection
+                            that GET authenticated
+```
+
+Seeing `ntlm_prime.retry` in the log means the farm has this problem and the
+connector is working around it. That is worth reporting to the farm admin —
+enabling **Kerberos/Negotiate** fixes it properly — but it is not a blocker.
+
+The retry only happens when the GET **succeeds**. If the GET is refused too,
+the credential is genuinely being rejected and no second POST is attempted:
+spending an extra failed authentication against an account with a lockout
+policy is not a trade worth making.
+
 ### `FAILED: SSLError`
 
 Only happens over **https**. Old IIS offers TLS 1.0 with ciphers modern OpenSSL

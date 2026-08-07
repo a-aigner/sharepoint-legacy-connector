@@ -679,3 +679,87 @@ def test_the_differential_does_not_count_a_denial_redirect_as_reaching_the_site(
     # Counting that 302 as success would have read this as "_vti_bin is
     # restricted" when in fact the account cannot read the site at all.
     assert "cannot read this web at all" in lines
+
+
+# --------------------------------------------------------------------------- #
+# NTLM connection priming
+#
+# Confirmed on the reported farm: a browser and our own client can both GET
+# /_vti_bin/Webs.asmx, and the SOAP POST to the same URL is refused. NTLM
+# authenticates a connection, and IIS drops it when it 401s a request carrying
+# a body, so the handshake legs land on different sockets.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def ntlm_tp(tmp_path: Path) -> Transport:
+    return Transport(
+        make_settings(tmp_path, auth_mode="ntlm", username="CONTOSO\\p", password="pw", max_retries=1)
+    )
+
+
+def test_a_post_refused_where_a_get_succeeds_is_retried_and_works(rsps, ntlm_tp: Transport) -> None:
+    rsps.add(responses.POST, ENDPOINT, status=401)  # the body kills the handshake
+    rsps.add(responses.GET, ENDPOINT, status=200, body="<html>service description</html>")
+    rsps.add(responses.POST, ENDPOINT, status=200, body="<ok/>")
+
+    assert ntlm_tp.post_soap(ENDPOINT, b"<x/>", "op") == b"<ok/>"
+
+    assert [c.request.method for c in rsps.calls] == ["POST", "GET", "POST"]
+
+
+def test_a_genuinely_refused_credential_is_not_retried(rsps, ntlm_tp: Transport) -> None:
+    """The GET is the safety check: if it is refused too, the account is the problem.
+
+    Retrying there would spend a second failed authentication against an account
+    that may well have a lockout policy.
+    """
+    rsps.add(responses.POST, ENDPOINT, status=401)
+    rsps.add(responses.GET, ENDPOINT, status=401)
+
+    with pytest.raises(AuthenticationError):
+        ntlm_tp.post_soap(ENDPOINT, b"<x/>", "op")
+
+    # One probing GET, and no second POST.
+    assert [c.request.method for c in rsps.calls] == ["POST", "GET"]
+
+
+def test_priming_is_attempted_only_once(rsps, ntlm_tp: Transport) -> None:
+    """A farm that 401s the POST even after priming must not loop."""
+    rsps.add(responses.POST, ENDPOINT, status=401)
+    rsps.add(responses.GET, ENDPOINT, status=200)
+    rsps.add(responses.POST, ENDPOINT, status=401)
+
+    with pytest.raises(AuthenticationError):
+        ntlm_tp.post_soap(ENDPOINT, b"<x/>", "op")
+
+    assert [c.request.method for c in rsps.calls] == ["POST", "GET", "POST"]
+
+
+def test_priming_can_be_switched_off(rsps, tmp_path: Path) -> None:
+    tp = Transport(
+        make_settings(tmp_path, auth_mode="ntlm", username="u", password="p", ntlm_prime_connection=False)
+    )
+    rsps.add(responses.POST, ENDPOINT, status=401)
+
+    with pytest.raises(AuthenticationError):
+        tp.post_soap(ENDPOINT, b"<x/>", "op")
+
+    assert [c.request.method for c in rsps.calls] == ["POST"]
+
+
+def test_priming_does_not_apply_to_password_schemes(rsps, tmp_path: Path) -> None:
+    """Basic sends the credential on every request; there is no connection to prime."""
+    tp = Transport(make_settings(tmp_path, auth_mode="basic", username="u", password="p"))
+    rsps.add(responses.POST, ENDPOINT, status=401)
+
+    with pytest.raises(AuthenticationError):
+        tp.post_soap(ENDPOINT, b"<x/>", "op")
+
+    assert [c.request.method for c in rsps.calls] == ["POST"]
+
+
+def test_a_healthy_farm_pays_nothing_for_this(rsps, ntlm_tp: Transport) -> None:
+    rsps.add(responses.POST, ENDPOINT, status=200, body="<ok/>")
+    assert ntlm_tp.post_soap(ENDPOINT, b"<x/>", "op") == b"<ok/>"
+    assert len(rsps.calls) == 1

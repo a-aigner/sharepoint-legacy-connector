@@ -98,6 +98,21 @@ def _dump_json(payload: Any) -> str:
     return json.dumps(payload, indent=2, ensure_ascii=False, default=str)
 
 
+def ensure_client(context: Context) -> None:
+    """Build the transport before any step narration begins.
+
+    A client that cannot be constructed is a problem with this machine's
+    configuration, and nothing has been asked of the farm yet. Letting it
+    surface from inside step 1 reports it as "Reach the server — FAILED",
+    which blames the server for a request that never left the process.
+    """
+    try:
+        _ = context.transport
+    except IntegratedAuthUnavailable as exc:
+        echo(f"{exc}")
+        raise typer.Exit(2) from exc
+
+
 def report_traffic(context: Context) -> None:
     """Print what left the process. Silent when no transport was ever built."""
     transport = context.transport_if_built
@@ -305,6 +320,7 @@ def probe(ctx: typer.Context) -> None:
     if settings.log_bodies:
         steps.info(f"body trace  : {settings.resolved_trace_file} (mode 0600)")
     echo("")
+    ensure_client(context)
 
     auth: AuthProbe | None = None
     version = None
@@ -475,6 +491,7 @@ def probe_rest(ctx: typer.Context) -> None:
     steps.info(f"auth mode   : {settings.auth_mode} (user: {settings.username or '<none>'})")
     steps.info(f"endpoint    : {settings.base_url}/_vti_bin/ListData.svc")
     echo("")
+    ensure_client(context)
 
     auth: AuthProbe | None = None
     #: "ok" | "denied" | "absent" | "error". Why REST failed decides whether it
@@ -659,6 +676,7 @@ def permissions(
     steps.heading(f"spconnect permissions -> {settings.base_url}")
     steps.info(f"identity    : {settings.username or 'the current process identity'}")
     echo("")
+    ensure_client(context)
 
     auth: AuthProbe | None = None
 

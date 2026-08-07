@@ -577,6 +577,10 @@ def test_probe_explains_a_missing_integrated_provider(tmp_path: Path, monkeypatc
     assert "needs a platform auth provider" in result.stdout
     # No transport was ever built, so there is no traffic to report.
     assert "HTTP requests" not in result.stdout
+    # And no step ran: nothing was asked of the farm, so blaming step 1 for it
+    # ("Reach the server ... FAILED") would point at the wrong machine.
+    assert "[1/8]" not in result.stdout
+    assert "Reach the server" not in result.stdout
 
 
 def test_every_command_explains_it_not_just_probe(tmp_path: Path, monkeypatch, capsys) -> None:

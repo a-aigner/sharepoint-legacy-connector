@@ -343,26 +343,57 @@ def parent_value(row: dict[str, Any], key: str) -> int | None:
     return None
 
 
-def detect_parent_key(rows: list[dict[str, Any]]) -> str | None:
+#: Foreign keys every SharePoint list carries, which point at people or content
+#: types rather than at a parent row.
+FK_IGNORED = frozenset({"Id", "CreatedById", "ModifiedById", "ContentTypeID", "OwshiddenversionId"})
+
+
+def candidate_parent_keys(row: dict[str, Any]) -> list[str]:
+    """Properties that could hold a foreign key.
+
+    ``ListData.svc`` renders a Lookup column as a navigation property plus a
+    scalar ``<Name>Id`` holding the target row's ``Id``. The name of that
+    scalar follows the *lookup's display column*, not the list it points at —
+    on this farm a comment's link to its ticket is ``TicketNumberId``, and on
+    another farm the same relationship could be called anything at all.
+    """
+    return [
+        key
+        for key in row
+        if key not in FK_IGNORED and (key.endswith(("Id", "ID")) or "parent" in key.lower())
+    ]
+
+
+def detect_parent_key(rows: list[dict[str, Any]], ticket_ids: set[int] | None = None) -> str | None:
     """Which property points a comment at its ticket.
 
-    The display page links a new comment with ``?ParentID=14819``, but that is
-    the query string, not necessarily the OData property — a lookup surfaces as
-    ``<Name>Id`` while a plain number field keeps its own name. So score the
-    candidates on real data instead of assuming either.
+    Guessing from names does not survive contact with a real farm — there is no
+    ``ParentID`` here, and the column that does the job is named after a lookup's
+    display column. So when the ticket Ids are known, score each candidate by how
+    many of its values actually *are* ticket Ids and let the data decide. That
+    identifies the relationship regardless of what anyone called it.
+
+    Without ticket Ids to check against, fall back to counting non-empty values,
+    which is weaker but still better than a name match.
     """
-    scored: list[tuple[int, str]] = []
-    sample = rows[:200]
-    for key in sample[0] if sample else []:
-        if "parent" not in key.lower():
+    sample = rows[:500]
+    if not sample:
+        return None
+
+    scored: list[tuple[int, int, str]] = []
+    for key in candidate_parent_keys(sample[0]):
+        values = [v for v in (parent_value(row, key) for row in sample) if v is not None]
+        if not values:
             continue
-        hits = sum(1 for row in sample if parent_value(row, key) is not None)
+        hits = sum(1 for v in values if v in ticket_ids) if ticket_ids else len(values)
         if hits:
-            scored.append((hits, key))
+            # Ties break toward the column that is populated more often.
+            scored.append((hits, len(values), key))
+
     if not scored:
         return None
     scored.sort(reverse=True)
-    return scored[0][1]
+    return scored[0][2]
 
 
 def sort_key(row: dict[str, Any]) -> tuple[str, int]:
@@ -377,15 +408,19 @@ def join(tickets_path: Path, comments_path: Path, out_path: Path, parent_key: st
         note("  nothing to join — no comments on disk")
         return
 
-    key = parent_key or detect_parent_key(comments)
+    tickets = read_jsonl(tickets_path)
+    ticket_ids = {t["Id"] for t in tickets if isinstance(t.get("Id"), int)}
+
+    key = parent_key or detect_parent_key(comments, ticket_ids)
     if key is None:
-        note(
-            "  ! could not identify the parent field on the comment rows.\n"
-            f"    Properties present: {', '.join(sorted(comments[0]))}\n"
-            "    Rerun with --parent-key <name> once you spot it."
-        )
+        note("  ! could not identify the parent field on the comment rows.")
+        note(f"    Foreign-key candidates: {', '.join(candidate_parent_keys(comments[0])) or 'none'}")
+        note(f"    All properties: {', '.join(sorted(comments[0]))}")
+        note("    Rerun with --parent-key <name> once you spot it.")
         return
-    note(f"  joining on {key!r}")
+    note(
+        f"  joining on {key!r}" + (f" (matched against {len(ticket_ids):,} ticket Ids)" if ticket_ids else "")
+    )
 
     grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
     orphans = 0
@@ -399,7 +434,6 @@ def join(tickets_path: Path, comments_path: Path, out_path: Path, parent_key: st
     for thread in grouped.values():
         thread.sort(key=sort_key)
 
-    tickets = read_jsonl(tickets_path)
     matched = 0
     with out_path.open("w", encoding="utf-8") as handle:
         for ticket in tickets:

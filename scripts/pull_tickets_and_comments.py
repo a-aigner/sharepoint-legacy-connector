@@ -145,10 +145,18 @@ def error_message(body: bytes) -> str:
     return " ".join(text.split())[:300] or "(empty body)"
 
 
-def probe(transport: Transport, url: str) -> tuple[int, str, bytes]:
-    """One GET that reports rather than raises. Returns ``(status, detail, body)``."""
+def probe(transport: Transport, url: str, *, language: str | None = None) -> tuple[int, str, bytes]:
+    """One GET that reports rather than raises. Returns ``(status, detail, body)``.
+
+    ``language`` overrides the session's ``Accept-Language`` for this request
+    only, which is what lets the language comparison ask the same collection
+    the same question in three languages.
+    """
+    headers = {"Accept": ACCEPT_ENTITIES}
+    if language:
+        headers["Accept-Language"] = language
     try:
-        response = transport.request("GET", url, headers={"Accept": ACCEPT_ENTITIES})
+        response = transport.request("GET", url, headers=headers)
     except AuthenticationError:
         return 401, "credential refused", b""
     except NotFoundError:
@@ -285,6 +293,9 @@ def diagnose(transport: Transport, service: ODataService, entity_set: str, page_
         report_property_names(first_row)
         note("")
 
+    compare_languages(transport, service, entity_set)
+    note("")
+
     ok = lambda name: 200 <= results.get(name, 0) < 300  # noqa: E731
 
     if ok("bare") and not ok("$select=Id only") and not ok("$filter only"):
@@ -376,9 +387,15 @@ class CollectionSchema:
         return f"key={self.key or '-'} created={self.created or '-'} ({len(self.properties)} properties)"
 
 
-def discover_schema(transport: Transport, service: ODataService, entity_set: str) -> CollectionSchema:
+def discover_schema(
+    transport: Transport,
+    service: ODataService,
+    entity_set: str,
+    *,
+    language: str | None = None,
+) -> CollectionSchema:
     """One row, to learn what this service calls things. Costs one request."""
-    status, detail, body = probe(transport, f"{service.endpoint}/{entity_set}?$top=1")
+    status, detail, body = probe(transport, f"{service.endpoint}/{entity_set}?$top=1", language=language)
     if not (200 <= status < 300):
         raise ODataError(f"could not read a row from {entity_set}: {detail}")
     names = row_property_names(body)
@@ -388,6 +405,47 @@ def discover_schema(transport: Transport, service: ODataService, entity_set: str
         key=resolve_property(names, KEY_ALIASES),
         created=resolve_property(names, CREATED_ALIASES),
     )
+
+
+#: Asked of the same collection in --diagnose, to show what language negotiation
+#: actually changes on this farm before anyone depends on it.
+COMPARED_LANGUAGES: tuple[str | None, ...] = (None, "en-US", "de-DE")
+
+
+def compare_languages(transport: Transport, service: ODataService, entity_set: str) -> None:
+    """What each ``Accept-Language`` yields for the columns this script needs.
+
+    SharePoint's MUI resolves *system* column display names from installed
+    language packs, and ListData.svc derives OData property names from display
+    names — so the same collection answers with ``Created`` or ``Erstellt``
+    depending on who asks. Custom columns are not translated unless someone
+    entered translations, so switching language moves some names and not
+    others. Worth seeing rather than assuming.
+    """
+    note("  language negotiation — the same collection, asked in three languages")
+    seen: list[tuple[str, CollectionSchema]] = []
+    for language in COMPARED_LANGUAGES:
+        label = language or "(as configured)"
+        try:
+            schema = discover_schema(transport, service, entity_set, language=language)
+        except ODataError as exc:
+            note(f"    {label:<17} failed: {exc}")
+            continue
+        seen.append((label, schema))
+        key_name = schema.key or "-"
+        created_name = schema.created or "-"
+        note(
+            f"    {label:<17} key={key_name:<8} created={created_name:<10} "
+            f"{len(schema.properties)} properties"
+        )
+
+    keys = {s.key for _, s in seen}
+    if len(keys) > 1:
+        note("  The key property name CHANGES with language on this farm. Pin it with")
+        note("  --language so two machines cannot disagree about the schema.")
+    elif seen:
+        note("  Language did not change the key here — MUI is off, or no language pack")
+        note("  is installed for the alternatives, so --language buys nothing.")
 
 
 # --------------------------------------------------------------------------- #
@@ -765,7 +823,7 @@ RELEVANT_SETTINGS = (
 )
 
 
-def banner(settings: Settings, out: Path) -> None:
+def banner(settings: Settings, out: Path, language: str | None = None) -> None:
     """Everything that decides whether a request succeeds, before one is sent.
 
     A failure report that omits the effective configuration is a failure report
@@ -785,6 +843,8 @@ def banner(settings: Settings, out: Path) -> None:
     note(f"  {'output':<{width}} {out.resolve()}")
     for key in RELEVANT_SETTINGS:
         note(f"  {key:<{width}} {redacted.get(key)}")
+    negotiated = language or "(unset — the web's own language)"
+    note(f"  {'Accept-Language':<{width}} {negotiated}")
     if settings.log_bodies:
         note(f"  {'body trace':<{width}} {settings.resolved_trace_file}")
     note("=" * 72)
@@ -869,6 +929,7 @@ def main() -> int:
     add("--list-sets", action="store_true", help="print every collection and exit")
     add("--diagnose", action="store_true", help="bisect the query options against the ticket list and exit")
     add("--no-join", action="store_true", help="skip the joined output file")
+    add("--language", default=None, help="Accept-Language for every request, e.g. en-US (default: unset)")
     add("--env-file", default=None, help="path to .env")
     add("-v", "--verbose", action="store_true", help="log every HTTP request and response")
     add("--log-bodies", action="store_true", help="also write raw bodies to a trace file")
@@ -885,8 +946,13 @@ def main() -> int:
     setup_logging("DEBUG" if args.verbose else "INFO", settings.log_format)
 
     started = time.monotonic()
-    banner(settings, args.out)
+    banner(settings, args.out, args.language)
     transport = Transport(settings)
+    if args.language:
+        # On the session, not per request: ODataService builds its own requests
+        # for the service document and the count, and those must ask in the same
+        # language as everything else or the schema will not be consistent.
+        transport.session.headers["Accept-Language"] = args.language
     service = ODataService(transport, settings.base_url)
 
     try:

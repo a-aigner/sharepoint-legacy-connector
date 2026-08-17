@@ -27,15 +27,30 @@ import argparse
 import json
 import sys
 import time
+import traceback
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from spconnect.config import load_settings, setup_logging
-from spconnect.services.odata import ODataError, ODataService, normalise_name
-from spconnect.transport import AuthenticationError, Transport
+from spconnect.config import Settings, load_settings, setup_logging
+from spconnect.console import format_bytes
+from spconnect.services.odata import (
+    ODataError,
+    ODataNotJson,
+    ODataService,
+    ODataUnavailable,
+    normalise_name,
+)
+from spconnect.transport import (
+    AuthenticationError,
+    NotFoundError,
+    RedirectRefused,
+    RetryableTransportError,
+    Transport,
+    TransportError,
+)
 
 DEFAULT_TICKETS = "Ticket"
 DEFAULT_COMMENTS = "TicketComment"
@@ -289,6 +304,111 @@ def join(tickets_path: Path, comments_path: Path, out_path: Path, parent_key: st
 
 
 # --------------------------------------------------------------------------- #
+# narration
+# --------------------------------------------------------------------------- #
+
+RELEVANT_SETTINGS = (
+    "base_url",
+    "auth_mode",
+    "username",
+    "verify_ssl",
+    "allow_legacy_tls",
+    "ntlm_send_cbt",
+    "ntlm_prime_connection",
+    "requests_per_second",
+    "timeout_seconds",
+    "max_retries",
+)
+
+
+def banner(settings: Settings, out: Path) -> None:
+    """Everything that decides whether a request succeeds, before one is sent.
+
+    A failure report that omits the effective configuration is a failure report
+    that cannot be acted on — half the ways this can break are settings the
+    operator believes are set differently than they are.
+
+    Printed before the transport is built, so the warnings that construction
+    emits (legacy TLS, unverified certificates, a bare-IP base URL) appear
+    underneath the configuration that caused them rather than above it.
+    """
+    redacted = settings.redacted_dict()
+    width = max(len(k) for k in RELEVANT_SETTINGS)
+    note("=" * 72)
+    note("spconnect — tickets + comments over ListData.svc")
+    note("=" * 72)
+    note(f"  {'endpoint':<{width}} {settings.base_url}/_vti_bin/ListData.svc")
+    note(f"  {'output':<{width}} {out.resolve()}")
+    for key in RELEVANT_SETTINGS:
+        note(f"  {key:<{width}} {redacted.get(key)}")
+    if settings.log_bodies:
+        note(f"  {'body trace':<{width}} {settings.resolved_trace_file}")
+    note("=" * 72)
+
+
+def footer(transport: Transport, started: float) -> None:
+    total = transport.request_count + transport.side_channel_requests
+    elapsed = time.monotonic() - started
+    note("")
+    note("-" * 72)
+    note(
+        f"  {total} HTTP request(s), {format_bytes(transport.bytes_received)} received, "
+        f"{elapsed:.1f}s elapsed"
+    )
+    note("-" * 72)
+
+
+def explain_failure(exc: BaseException) -> list[str]:
+    """What this specific exception means here, and what to run next.
+
+    Keyed on type rather than on message text: the messages come from three
+    different layers and are not stable enough to match on.
+    """
+    if isinstance(exc, AuthenticationError):
+        return [
+            "The credential was refused (401/403).",
+            "`spconnect probe-rest` diagnoses this properly — it compares a GET",
+            "against a POST on the same directory and names which one broke.",
+        ]
+    if isinstance(exc, RedirectRefused):
+        return [
+            "The server redirected rather than answering. That is usually a sign-in",
+            "page, an alternate access mapping, or the wrong zone for SP_BASE_URL.",
+            f"Suggested base URL, if any: {getattr(exc, 'suggested_base_url', None)}",
+        ]
+    if isinstance(exc, ODataUnavailable | NotFoundError):
+        return [
+            "ListData.svc answered 404 — the OData feature is off on this web, or",
+            "SP_BASE_URL points at a web that does not have it.",
+            "Confirm with: spconnect probe-rest",
+        ]
+    if isinstance(exc, ODataNotJson):
+        return [
+            "The service answered in a representation this build does not render as",
+            "JSON. That is expected for the service document and handled; seeing it",
+            "on a feed is not. Rerun with -v and send the http.response line.",
+        ]
+    if isinstance(exc, RetryableTransportError):
+        return [
+            "The request never completed — connection, timeout, or a 5xx that",
+            "survived all retries. If this is TLS, SP_ALLOW_LEGACY_TLS=true and",
+            "SP_VERIFY_SSL=false are the two settings that matter.",
+            "Rerun with -v to see how far the retries got.",
+        ]
+    if isinstance(exc, ODataError):
+        return [
+            "ListData.svc returned an error body. On a list over 5000 items this is",
+            "usually the list view threshold — but a read paged on Id should not hit",
+            "it, so the URL in the message is the thing to look at.",
+            "Rerun with -v --log-bodies and send the response.",
+        ]
+    return [
+        "Unexpected failure — the traceback above is the evidence.",
+        "Rerun with -v --log-bodies for the full request/response record.",
+    ]
+
+
+# --------------------------------------------------------------------------- #
 
 
 def main() -> int:
@@ -305,52 +425,82 @@ def main() -> int:
     add("--list-sets", action="store_true", help="print every collection and exit")
     add("--no-join", action="store_true", help="skip the joined output file")
     add("--env-file", default=None, help="path to .env")
-    add("-v", "--verbose", action="store_true", help="debug logging, including every URL")
+    add("-v", "--verbose", action="store_true", help="log every HTTP request and response")
+    add("--log-bodies", action="store_true", help="also write raw bodies to a trace file")
+    add("--trace-file", default=None, help="where --log-bodies writes (default <landing>/_trace.log)")
     args = parser.parse_args()
 
-    settings = load_settings(env_file=args.env_file)
-    setup_logging("DEBUG" if args.verbose else "WARNING", settings.log_format)
+    overrides: dict[str, Any] = {}
+    if args.log_bodies:
+        overrides["log_bodies"] = True
+    if args.trace_file:
+        overrides["trace_file"] = args.trace_file
 
+    settings = load_settings(env_file=args.env_file, overrides=overrides)
+    setup_logging("DEBUG" if args.verbose else "INFO", settings.log_format)
+
+    started = time.monotonic()
+    banner(settings, args.out)
     transport = Transport(settings)
     service = ODataService(transport, settings.base_url)
 
     try:
-        note(f"ListData.svc → {service.endpoint}")
+        note("\n[1/4] reading the service document")
         available = service.entity_sets()
-        note(f"{len(available)} collection(s) visible, served as {service.representation or 'atom'}\n")
+        note(f"      {len(available)} collection(s), served as {service.representation or 'atom'}")
 
         if args.list_sets:
+            note("")
             for name in sorted(available):
                 print(name)
+            footer(transport, started)
             return 0
 
+        note("\n[2/4] resolving collection names")
         tickets_set = resolve_entity_set(service, args.tickets, available)
         comments_set = resolve_entity_set(service, args.comments, available)
+        note(f"      tickets  -> {tickets_set}")
+        note(f"      comments -> {comments_set}")
 
         tickets_path = args.out / "tickets.jsonl"
         comments_path = args.out / "comments.jsonl"
 
-        note(f"tickets  <- {tickets_set}")
+        note(f"\n[3/4] pulling {tickets_set}")
         pull(service, tickets_set, tickets_path, page_size=args.page_size, limit=args.limit)
-        note(f"\ncomments <- {comments_set}")
+        note(f"\n[4/4] pulling {comments_set}")
         pull(service, comments_set, comments_path, page_size=args.page_size, limit=args.limit)
 
         if not args.no_join:
             note("\njoining")
             join(tickets_path, comments_path, args.out / "tickets_with_comments.jsonl", args.parent_key)
 
-    except AuthenticationError as exc:
-        note(f"\nAUTH FAILED: {exc}\n\nRun `spconnect probe-rest` — it explains this one properly.")
-        return 2
-    except ODataError as exc:
-        note(f"\nREST FAILED: {exc}")
-        return 1
     except KeyboardInterrupt:
-        note("\ninterrupted — rerun to resume from the last Id written")
+        note("\n\ninterrupted — rerun to resume from the last Id written")
+        footer(transport, started)
         return 130
+    except (TransportError, ODataError) as exc:
+        note(f"\n\nFAILED: {type(exc).__name__}: {exc}")
+        if args.verbose:
+            note("\n" + traceback.format_exc())
+        note("")
+        for line in explain_failure(exc):
+            note(f"  {line}")
+        footer(transport, started)
+        return 2 if isinstance(exc, AuthenticationError) else 1
+    except Exception as exc:
+        # Anything not from our own layers is a bug or an environment problem,
+        # and the traceback is the only useful thing to say about it. Print it
+        # unconditionally rather than hiding it behind -v.
+        note(f"\n\nFAILED: {type(exc).__name__}: {exc}\n")
+        note(traceback.format_exc())
+        for line in explain_failure(exc):
+            note(f"  {line}")
+        footer(transport, started)
+        return 1
     finally:
         transport.close()
 
+    footer(transport, started)
     return 0
 
 

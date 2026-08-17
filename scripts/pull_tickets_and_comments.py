@@ -29,6 +29,8 @@ import sys
 import time
 import traceback
 from collections import defaultdict
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +46,7 @@ from spconnect.services.odata import (
     ODataService,
     ODataUnavailable,
     normalise_name,
+    parse_atom_feed,
     parse_odata_datetime,
 )
 from spconnect.transport import (
@@ -320,12 +323,105 @@ def diagnose(transport: Transport, service: ODataService, entity_set: str, page_
 
 
 # --------------------------------------------------------------------------- #
+# the localised schema
+# --------------------------------------------------------------------------- #
+#
+# ListData.svc derives OData property names from column *display* names, and
+# display names are localised. The same farm therefore answers with `Id`,
+# `Created`, `CreatedById` to one caller and `ID`, `Erstellt`, `ErstelltVonId`
+# to another, depending on language. OData names are case-sensitive, so a
+# hardcoded English name is not merely fragile — on a German web it refers to
+# a property that does not exist, and the server says so with a 400.
+#
+# Nothing below matches a name literally. Each well-known column is resolved by
+# role against the names the wire actually returned.
+
+KEY_ALIASES = ("Id", "ID")
+CREATED_ALIASES = ("Created", "Erstellt")
+#: Foreign keys every list carries. They point at people or content types, never
+#: at a parent row, and must not be mistaken for the link between two lists.
+HOUSEKEEPING_FK_ALIASES = (
+    "CreatedById",
+    "ModifiedById",
+    "ContentTypeID",
+    "ErstelltVonId",
+    "GeändertVonId",
+    "InhaltstypID",
+)
+
+
+def resolve_property(names: Iterable[str], aliases: Sequence[str]) -> str | None:
+    """The first alias this service actually uses, exact case preferred."""
+    present = list(names)
+    for alias in aliases:
+        if alias in present:
+            return alias
+    lowered = {n.lower(): n for n in present}
+    for alias in aliases:
+        if alias.lower() in lowered:
+            return lowered[alias.lower()]
+    return None
+
+
+@dataclass
+class CollectionSchema:
+    """What one collection calls the columns this script depends on."""
+
+    entity_set: str
+    properties: list[str]
+    key: str | None
+    created: str | None
+
+    def describe(self) -> str:
+        return f"key={self.key or '-'} created={self.created or '-'} ({len(self.properties)} properties)"
+
+
+def discover_schema(transport: Transport, service: ODataService, entity_set: str) -> CollectionSchema:
+    """One row, to learn what this service calls things. Costs one request."""
+    status, detail, body = probe(transport, f"{service.endpoint}/{entity_set}?$top=1")
+    if not (200 <= status < 300):
+        raise ODataError(f"could not read a row from {entity_set}: {detail}")
+    names = row_property_names(body)
+    return CollectionSchema(
+        entity_set=entity_set,
+        properties=names,
+        key=resolve_property(names, KEY_ALIASES),
+        created=resolve_property(names, CREATED_ALIASES),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # paging
 # --------------------------------------------------------------------------- #
 
 
-def highest_id_on_disk(path: Path) -> int:
-    """Resume point. Rows are written in Id order, but scan rather than trust it.
+def parse_feed(body: bytes) -> tuple[list[dict[str, Any]], str | None]:
+    """Rows and the continuation link, from either representation."""
+    text = body.decode("utf-8", "replace").strip()
+    if text.startswith("{"):
+        payload = json.loads(text)
+        node = payload.get("d") if isinstance(payload, dict) else None
+        if isinstance(node, dict):
+            rows = node.get("results")
+            if isinstance(rows, list):
+                return [r for r in rows if isinstance(r, dict)], node.get("__next")
+            return [node], None
+        if isinstance(node, list):
+            return [r for r in node if isinstance(r, dict)], None
+        return [], None
+    rows, next_url = parse_atom_feed(etree.fromstring(body))
+    return [r for r in rows if isinstance(r, dict)], next_url
+
+
+def fetch_page(transport: Transport, url: str) -> tuple[list[dict[str, Any]], str | None]:
+    status, detail, body = probe(transport, url)
+    if not (200 <= status < 300):
+        raise ODataError(f"HTTP {status} for {url}: {detail}")
+    return parse_feed(body)
+
+
+def highest_id_on_disk(path: Path, key: str) -> int:
+    """Resume point. Rows are written in key order, but scan rather than trust it.
 
     A run killed mid-write can leave a truncated final line; a scan that skips
     unparseable lines resumes correctly where reading only the last line would
@@ -340,7 +436,7 @@ def highest_id_on_disk(path: Path) -> int:
             if not line:
                 continue
             try:
-                row_id = json.loads(line).get("Id")
+                row_id = json.loads(line).get(key)
             except json.JSONDecodeError:
                 continue
             if isinstance(row_id, int) and row_id > best:
@@ -348,76 +444,129 @@ def highest_id_on_disk(path: Path) -> int:
     return best
 
 
+def max_key(rows: Sequence[dict[str, Any]], key: str) -> int | None:
+    values = [r[key] for r in rows if isinstance(r.get(key), int)]
+    return max(values) if values else None
+
+
 def pull(
+    transport: Transport,
     service: ODataService,
-    entity_set: str,
+    schema: CollectionSchema,
     path: Path,
     *,
     page_size: int,
     limit: int | None,
 ) -> int:
-    """Page one collection to JSONL, resuming from whatever is already there."""
+    """Page one collection to JSONL, resuming from whatever is already there.
+
+    Two strategies, in order of preference:
+
+    **Key paging** — ``$filter=<key> gt N&$orderby=<key>``. Resumable across
+    runs, because the checkpoint is a value in the data rather than a token the
+    server minted.
+
+    **Server-driven paging** — take the default page and follow ``__next``.
+    Needs no property names at all, so it survives a service that will not let
+    its key be filtered. Not resumable across runs: the continuation is the
+    server's, and it is not offered again on a later connection. Rows already
+    on disk are skipped by key where a key is known, so a rerun costs requests
+    but never duplicates.
+    """
+    entity_set = schema.entity_set
     path.parent.mkdir(parents=True, exist_ok=True)
-    last_id = highest_id_on_disk(path)
+    base = f"{service.endpoint}/{entity_set}"
+    key = schema.key
+    last_id = highest_id_on_disk(path, key) if key else 0
 
     try:
-        total = service.count(entity_set)
-        expected = f"{total:,}"
+        expected = f"{service.count(entity_set):,}"
     except ODataError:
         # A count over the view threshold throws where a paged read does not.
         # Not knowing the total is a cosmetic loss; refusing to run over it
         # would be a real one.
-        expected = "unknown (count refused — over the view threshold)"
+        expected = "unknown (count refused)"
 
+    note(f"  {entity_set}: {expected} row(s) expected, {schema.describe()}")
     if last_id:
-        note(f"  resuming {entity_set} after Id {last_id:,}")
-    note(f"  {entity_set}: {expected} row(s) expected")
+        note(f"  resuming after {key} {last_id:,}")
 
-    written = 0
-    pages = 0
+    url: str | None = None
+    if key:
+        url = f"{base}?$filter={key}%20gt%20{last_id}&$orderby={key}&$top={page_size}"
+    else:
+        note("  no key property on this collection — using server-driven paging")
+
+    written = skipped = pages = 0
     started = time.monotonic()
+    seen_on_disk = last_id
 
     with path.open("a", encoding="utf-8") as handle:
         while True:
+            if url is None:
+                url = base  # server's default page, no options
             try:
-                page = service.get_items(entity_set, last_id=last_id, top=page_size)
-            except ODataError:
-                # Which page died matters as much as why: a failure on the first
-                # request is a rejected query, a failure on the fortieth is data
-                # the server cannot render at that offset.
-                note(
-                    f"  ! failed on page {pages + 1} "
-                    f"(after Id {last_id:,}, {written:,} rows written, $top={page_size})"
-                )
-                note(f"    retry just this query with: --diagnose --page-size {page_size}")
+                rows, continuation = fetch_page(transport, url)
+            except ODataError as exc:
+                if pages == 0 and key:
+                    # The key is named right for this service and still refused.
+                    # Server-driven paging asks for nothing by name, so try it
+                    # before giving up.
+                    note(f"  ! key paging on {key!r} was refused: {exc}")
+                    note("    falling back to server-driven paging (follow __next)")
+                    key = None
+                    url = base
+                    continue
+                note(f"  ! failed on page {pages + 1} ({written:,} rows written, $top={page_size})")
+                note(f"    retry this query with: --diagnose --page-size {page_size}")
                 raise
-            if not page.rows:
+            if not rows:
                 break
 
-            for row in page.rows:
+            fresh = rows
+            if key is None and seen_on_disk and schema.key:
+                # Continuation mode restarts at the top of the list; drop what a
+                # previous run already wrote rather than duplicating it.
+                fresh = [r for r in rows if not _at_or_below(r, schema.key, seen_on_disk)]
+                skipped += len(rows) - len(fresh)
+
+            for row in fresh:
                 handle.write(json.dumps(row, ensure_ascii=False, default=str))
                 handle.write("\n")
             handle.flush()
-
-            written += len(page.rows)
+            written += len(fresh)
             pages += 1
 
-            if page.max_id is None or page.max_id <= last_id:
-                # Without a strictly advancing Id the next request would repeat
-                # this one forever. Stop and say so rather than spin.
-                note(f"  ! {entity_set}: page {pages} did not advance past Id {last_id} — stopping")
-                break
-            last_id = page.max_id
-
             rate = written / max(time.monotonic() - started, 1e-6)
-            note(f"    page {pages}: +{len(page.rows)} → {written:,} rows, Id {last_id:,} ({rate:.0f}/s)")
+            note(f"    page {pages}: +{len(fresh)} → {written:,} rows ({rate:.0f}/s)")
 
             if limit is not None and written >= limit:
                 note(f"  stopping at --limit {limit}")
                 break
 
+            if key:
+                highest = max_key(rows, key)
+                if highest is None or highest <= last_id:
+                    # Without a strictly advancing key the next request would
+                    # repeat this one forever. Stop and say so rather than spin.
+                    note(f"  ! page {pages} did not advance past {key} {last_id} — stopping")
+                    break
+                last_id = highest
+                url = f"{base}?$filter={key}%20gt%20{last_id}&$orderby={key}&$top={page_size}"
+            else:
+                if not continuation:
+                    break
+                url = continuation
+
+    if skipped:
+        note(f"  {skipped:,} row(s) already on disk were skipped")
     note(f"  {entity_set}: {written:,} new row(s) → {path}")
     return written
+
+
+def _at_or_below(row: dict[str, Any], key: str, ceiling: int) -> bool:
+    value = row.get(key)
+    return isinstance(value, int) and value <= ceiling
 
 
 # --------------------------------------------------------------------------- #
@@ -453,29 +602,33 @@ def parent_value(row: dict[str, Any], key: str) -> int | None:
     if isinstance(value, str) and value.strip().isdigit():
         return int(value)
     if isinstance(value, dict):
-        inner = value.get("Id")
-        return inner if isinstance(inner, int) else None
+        inner = resolve_property(value, KEY_ALIASES)
+        target = value.get(inner) if inner else None
+        return target if isinstance(target, int) else None
     return None
 
 
-#: Foreign keys every SharePoint list carries, which point at people or content
-#: types rather than at a parent row.
-FK_IGNORED = frozenset({"Id", "CreatedById", "ModifiedById", "ContentTypeID", "OwshiddenversionId"})
-
-
 def candidate_parent_keys(row: dict[str, Any]) -> list[str]:
-    """Properties that could hold a foreign key.
+    """Properties that could hold a foreign key to another list.
 
     ``ListData.svc`` renders a Lookup column as a navigation property plus a
-    scalar ``<Name>Id`` holding the target row's ``Id``. The name of that
-    scalar follows the *lookup's display column*, not the list it points at —
-    on this farm a comment's link to its ticket is ``TicketNumberId``, and on
-    another farm the same relationship could be called anything at all.
+    scalar ``<Name>Id`` holding the target row's key. That scalar is named after
+    the lookup's *display column*, not the list it points at — here a comment's
+    link to its ticket is ``TicketNumberId``.
+
+    Excluded are the key itself and the housekeeping foreign keys every list
+    carries. Those are matched by role, not by their English spelling: on a
+    German web they arrive as ``ErstelltVonId`` and ``GeändertVonId``, and an
+    English-only exclusion list would offer them as parent candidates.
     """
+    ignored = {row_key for row_key in row if resolve_property([row_key], KEY_ALIASES) == row_key}
+    for alias in HOUSEKEEPING_FK_ALIASES:
+        found = resolve_property(row, [alias])
+        if found:
+            ignored.add(found)
+    ignored.update(n for n in row if n.lower().startswith("owshiddenversion"))
     return [
-        key
-        for key in row
-        if key not in FK_IGNORED and (key.endswith(("Id", "ID")) or "parent" in key.lower())
+        key for key in row if key not in ignored and (key.endswith(("Id", "ID")) or "parent" in key.lower())
     ]
 
 
@@ -529,9 +682,11 @@ def sort_key(row: dict[str, Any]) -> tuple[float, int]:
     coincidence. ``Created`` is nullable in the schema, so undated comments
     sort first rather than crashing the sort.
     """
-    created = row.get("Created")
+    created_name = resolve_property(row, CREATED_ALIASES)
+    created = row.get(created_name) if created_name else None
     moment = parse_odata_datetime(created) if isinstance(created, str) else None
-    row_id = row.get("Id")
+    key_name = resolve_property(row, KEY_ALIASES)
+    row_id = row.get(key_name) if key_name else None
     return (moment.timestamp() if moment else float("-inf"), row_id if isinstance(row_id, int) else 0)
 
 
@@ -543,7 +698,10 @@ def join(tickets_path: Path, comments_path: Path, out_path: Path, parent_key: st
         return
 
     tickets = read_jsonl(tickets_path)
-    ticket_ids = {t["Id"] for t in tickets if isinstance(t.get("Id"), int)}
+    ticket_key = resolve_property(tickets[0], KEY_ALIASES) if tickets else None
+    ticket_ids = (
+        {t[ticket_key] for t in tickets if isinstance(t.get(ticket_key), int)} if ticket_key else set()
+    )
 
     key = parent_key or detect_parent_key(comments, ticket_ids)
     if key is None:
@@ -571,7 +729,7 @@ def join(tickets_path: Path, comments_path: Path, out_path: Path, parent_key: st
     matched = 0
     with out_path.open("w", encoding="utf-8") as handle:
         for ticket in tickets:
-            ticket_id = ticket.get("Id")
+            ticket_id = ticket.get(ticket_key) if ticket_key else None
             thread = grouped.get(ticket_id, []) if isinstance(ticket_id, int) else []
             if thread:
                 matched += 1
@@ -581,7 +739,7 @@ def join(tickets_path: Path, comments_path: Path, out_path: Path, parent_key: st
     note(f"  {matched:,}/{len(tickets):,} ticket(s) have at least one comment → {out_path}")
     if orphans:
         note(f"  {orphans:,} comment(s) had no usable {key} and were left out of the join")
-    unmatched = set(grouped) - {t.get("Id") for t in tickets}
+    unmatched = set(grouped) - ticket_ids
     if unmatched:
         note(
             f"  {len(unmatched):,} parent Id(s) in comments match no ticket on disk "
@@ -758,13 +916,24 @@ def main() -> int:
             footer(transport, started)
             return 0
 
+        # One row from each collection, to learn what this service calls its key
+        # and its Created column. Both are localised, so neither can be assumed.
+        note("      reading one row from each to learn the property names")
+        ticket_schema = discover_schema(transport, service, tickets_set)
+        comment_schema = discover_schema(transport, service, comments_set)
+        note(f"      tickets  {ticket_schema.describe()}")
+        note(f"      comments {comment_schema.describe()}")
+        for schema in (ticket_schema, comment_schema):
+            if schema.key is None:
+                note(f"      ! no key property found on {schema.entity_set} — server-driven paging only")
+
         tickets_path = args.out / "tickets.jsonl"
         comments_path = args.out / "comments.jsonl"
 
         note(f"\n[3/{steps}] pulling {tickets_set}")
-        pull(service, tickets_set, tickets_path, page_size=args.page_size, limit=args.limit)
+        pull(transport, service, ticket_schema, tickets_path, page_size=args.page_size, limit=args.limit)
         note(f"\n[4/{steps}] pulling {comments_set}")
-        pull(service, comments_set, comments_path, page_size=args.page_size, limit=args.limit)
+        pull(transport, service, comment_schema, comments_path, page_size=args.page_size, limit=args.limit)
 
         if not args.no_join:
             note("\njoining")

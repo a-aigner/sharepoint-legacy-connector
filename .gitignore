@@ -31,3 +31,4 @@ htmlcov/
 .DS_Store
 .claude/
 
+$metadata.xml

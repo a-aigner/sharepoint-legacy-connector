@@ -42,6 +42,7 @@ from spconnect.services.odata import (
     ODataService,
     ODataUnavailable,
     normalise_name,
+    parse_odata_datetime,
 )
 from spconnect.transport import (
     AuthenticationError,
@@ -396,9 +397,28 @@ def detect_parent_key(rows: list[dict[str, Any]], ticket_ids: set[int] | None = 
     return scored[0][2]
 
 
-def sort_key(row: dict[str, Any]) -> tuple[str, int]:
+def sort_key(row: dict[str, Any]) -> tuple[float, int]:
+    """Order a thread by when each comment was written.
+
+    ``Edm.DateTime`` reaches us as a *string* in both representations and is
+    never decoded on this path — ``parse_odata_datetime`` runs only inside
+    ``ODataRowMapper``, which the landing-zone crawl uses and this script does
+    not. So the two serialisations arrive in different formats:
+
+    * JSON  ``/Date(1748528100000)/``
+    * Atom  ``2026-05-29T14:35:00``
+
+    Sorting those as text happens to work for ISO, and happens to work for
+    ``/Date(ms)/`` only while every timestamp has the same digit count — true
+    between 2001-09-09 and 2286, false for anything older, and false again for
+    the ``/Date(ms+0060)/`` offset form. Decoding to an instant removes the
+    coincidence. ``Created`` is nullable in the schema, so undated comments
+    sort first rather than crashing the sort.
+    """
     created = row.get("Created")
-    return (str(created) if created is not None else "", row.get("Id") or 0)
+    moment = parse_odata_datetime(created) if isinstance(created, str) else None
+    row_id = row.get("Id")
+    return (moment.timestamp() if moment else float("-inf"), row_id if isinstance(row_id, int) else 0)
 
 
 def join(tickets_path: Path, comments_path: Path, out_path: Path, parent_key: str | None) -> None:

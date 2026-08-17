@@ -98,6 +98,113 @@ def resolve_entity_set(service: ODataService, wanted: str, available: list[str])
 
 
 # --------------------------------------------------------------------------- #
+# query diagnosis
+# --------------------------------------------------------------------------- #
+
+ACCEPT_ENTITIES = "application/json;q=1.0, application/atom+xml;q=0.9, application/xml;q=0.8"
+
+
+def error_message(body: bytes) -> str:
+    """The server's own reason, dug out of whichever envelope it used.
+
+    SharePoint states the real cause — a threshold, an unsortable column, a
+    field it cannot serialise — inside a nested error document. Reporting the
+    first 300 raw bytes instead usually shows only the envelope.
+    """
+    text = body.decode("utf-8", "replace").strip()
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    else:
+        node: Any = payload.get("error") if isinstance(payload, dict) else None
+        if isinstance(node, dict):
+            message = node.get("message")
+            if isinstance(message, dict):
+                message = message.get("value")
+            if isinstance(message, str) and message.strip():
+                return " ".join(message.split())
+    # Atom/XML: <m:error><m:message xml:lang="…">reason</m:message></m:error>
+    lowered = text.lower()
+    start = lowered.find("<m:message")
+    if start == -1:
+        start = lowered.find("<message")
+    if start != -1:
+        opened = text.find(">", start)
+        closed = lowered.find("</", opened)
+        if opened != -1 and closed != -1:
+            inner = text[opened + 1 : closed].strip()
+            if inner:
+                return " ".join(inner.split())
+    return " ".join(text.split())[:300] or "(empty body)"
+
+
+def probe(transport: Transport, url: str) -> tuple[int, str]:
+    """One GET that reports rather than raises. Returns ``(status, detail)``."""
+    try:
+        response = transport.request("GET", url, headers={"Accept": ACCEPT_ENTITIES})
+    except AuthenticationError:
+        return 401, "credential refused"
+    except NotFoundError:
+        return 404, "not found"
+    except TransportError as exc:
+        return 0, f"{type(exc).__name__}: {exc}"
+    if response.status_code >= 400:
+        return response.status_code, error_message(response.content)
+    return response.status_code, f"{len(response.content):,} bytes"
+
+
+def diagnose(transport: Transport, service: ODataService, entity_set: str, page_size: int) -> None:
+    """Bisect the query the pull uses, one option at a time.
+
+    A 400 on the full query says the server refused *something*; it does not say
+    what. Running the options separately does, and it costs seven requests.
+    """
+    base = f"{service.endpoint}/{entity_set}"
+    ladder: list[tuple[str, str]] = [
+        ("bare", "?$top=1"),
+        ("$select=Id only", "?$select=Id&$top=1"),
+        ("$orderby only", "?$orderby=Id&$top=1"),
+        ("$filter only", "?$filter=Id%20gt%200&$top=1"),
+        ("$filter + $orderby", "?$filter=Id%20gt%200&$orderby=Id&$top=1"),
+        (f"full query, $top={page_size}", f"?$filter=Id%20gt%200&$orderby=Id&$top={page_size}"),
+        ("$inlinecount", "?$top=0&$inlinecount=allpages"),
+    ]
+
+    note(f"\ndiagnosing {entity_set} — {len(ladder)} requests")
+    note("")
+    results: dict[str, int] = {}
+    for name, query in ladder:
+        status, detail = probe(transport, base + query)
+        results[name] = status
+        verdict = "ok  " if 200 <= status < 300 else "FAIL"
+        note(f"  {verdict} {status:>3}  {name}")
+        note(f"            {detail[:200]}")
+    note("")
+
+    ok = lambda name: 200 <= results.get(name, 0) < 300  # noqa: E731
+
+    if not ok("bare"):
+        note("  VERDICT: the plainest possible read of this collection fails, so this")
+        note("  is not about paging. If '$select=Id only' passed, one of the columns")
+        note("  cannot be serialised by ListData.svc and $select is the way around it.")
+    elif not ok("$orderby only"):
+        note("  VERDICT: $orderby is what it refuses. On a list past the 5000-item")
+        note("  threshold SharePoint rejects a sort it cannot satisfy from an index.")
+        note("  ListData.svc already returns rows in Id order, so the sort can go.")
+    elif not ok("$filter only"):
+        note("  VERDICT: $filter is what it refuses — an encoding or syntax mismatch")
+        note("  in 'Id gt N' rather than a threshold.")
+    elif not ok(f"full query, $top={page_size}"):
+        note(f"  VERDICT: the options pass individually but not combined at $top={page_size}.")
+        note("  Retry with a smaller --page-size to separate size from combination.")
+    else:
+        note("  VERDICT: every query the pull uses passed here. The failure is")
+        note("  page-dependent — rerun the pull with -v --log-bodies and compare the")
+        note("  failing URL against these.")
+
+
+# --------------------------------------------------------------------------- #
 # paging
 # --------------------------------------------------------------------------- #
 
@@ -157,7 +264,18 @@ def pull(
 
     with path.open("a", encoding="utf-8") as handle:
         while True:
-            page = service.get_items(entity_set, last_id=last_id, top=page_size)
+            try:
+                page = service.get_items(entity_set, last_id=last_id, top=page_size)
+            except ODataError:
+                # Which page died matters as much as why: a failure on the first
+                # request is a rejected query, a failure on the fortieth is data
+                # the server cannot render at that offset.
+                note(
+                    f"  ! failed on page {pages + 1} "
+                    f"(after Id {last_id:,}, {written:,} rows written, $top={page_size})"
+                )
+                note(f"    retry just this query with: --diagnose --page-size {page_size}")
+                raise
             if not page.rows:
                 break
 
@@ -423,6 +541,7 @@ def main() -> int:
     add("--limit", type=int, default=None, help="stop after N new rows per collection")
     add("--parent-key", default=None, help="comment property naming the ticket, if autodetect fails")
     add("--list-sets", action="store_true", help="print every collection and exit")
+    add("--diagnose", action="store_true", help="bisect the query options against the ticket list and exit")
     add("--no-join", action="store_true", help="skip the joined output file")
     add("--env-file", default=None, help="path to .env")
     add("-v", "--verbose", action="store_true", help="log every HTTP request and response")
@@ -461,6 +580,11 @@ def main() -> int:
         comments_set = resolve_entity_set(service, args.comments, available)
         note(f"      tickets  -> {tickets_set}")
         note(f"      comments -> {comments_set}")
+
+        if args.diagnose:
+            diagnose(transport, service, tickets_set, args.page_size)
+            footer(transport, started)
+            return 0
 
         tickets_path = args.out / "tickets.jsonl"
         comments_path = args.out / "comments.jsonl"

@@ -32,6 +32,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+from lxml import etree
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from spconnect.config import Settings, load_settings, setup_logging
@@ -140,19 +142,95 @@ def error_message(body: bytes) -> str:
     return " ".join(text.split())[:300] or "(empty body)"
 
 
-def probe(transport: Transport, url: str) -> tuple[int, str]:
-    """One GET that reports rather than raises. Returns ``(status, detail)``."""
+def probe(transport: Transport, url: str) -> tuple[int, str, bytes]:
+    """One GET that reports rather than raises. Returns ``(status, detail, body)``."""
     try:
         response = transport.request("GET", url, headers={"Accept": ACCEPT_ENTITIES})
     except AuthenticationError:
-        return 401, "credential refused"
+        return 401, "credential refused", b""
     except NotFoundError:
-        return 404, "not found"
+        return 404, "not found", b""
     except TransportError as exc:
-        return 0, f"{type(exc).__name__}: {exc}"
+        return 0, f"{type(exc).__name__}: {exc}", b""
     if response.status_code >= 400:
-        return response.status_code, error_message(response.content)
-    return response.status_code, f"{len(response.content):,} bytes"
+        return response.status_code, error_message(response.content), response.content
+    return response.status_code, f"{len(response.content):,} bytes", response.content
+
+
+def row_property_names(body: bytes) -> list[str]:
+    """The property names on the first row of a feed, as the server spells them.
+
+    This is the only authority that matters for ``$select``/``$filter``/
+    ``$orderby``: OData property names are case-sensitive, and ``$metadata`` is
+    a *description* of the model, which a farm can contradict. What comes back
+    on the wire cannot.
+    """
+    text = body.decode("utf-8", "replace").strip()
+    if text.startswith("{"):
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return []
+        body_node = payload.get("d") if isinstance(payload, dict) else None
+        if isinstance(body_node, dict):
+            rows = body_node.get("results")
+            body_node = rows[0] if isinstance(rows, list) and rows else body_node
+        elif isinstance(body_node, list):
+            body_node = body_node[0] if body_node else None
+        return sorted(body_node) if isinstance(body_node, dict) else []
+
+    try:
+        root = etree.fromstring(body)
+    except etree.XMLSyntaxError:
+        return []
+    ns = "{http://schemas.microsoft.com/ado/2007/08/dataservices}"
+    return sorted({etree.QName(el).localname for el in root.iter() if str(el.tag).startswith(ns)})
+
+
+def next_link(body: bytes) -> str | None:
+    """The server's own continuation for this feed, if it offered one.
+
+    JSON verbose puts it at ``d.__next``; Atom uses ``<link rel="next">``. Its
+    presence is what decides whether a list can be walked without ``$filter``
+    or ``$orderby`` at all.
+    """
+    text = body.decode("utf-8", "replace").strip()
+    if text.startswith("{"):
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+        node = payload.get("d") if isinstance(payload, dict) else None
+        value = node.get("__next") if isinstance(node, dict) else None
+        return value if isinstance(value, str) else None
+    try:
+        root = etree.fromstring(body)
+    except etree.XMLSyntaxError:
+        return None
+    for el in root.iter():
+        if etree.QName(el).localname == "link" and el.get("rel") == "next":
+            return el.get("href")
+    return None
+
+
+def report_property_names(body: bytes, wanted: str = "Id") -> None:
+    """Say whether the property the queries depend on is really called that."""
+    names = row_property_names(body)
+    if not names:
+        note("  could not read property names off the first row")
+        return
+    note(f"  {len(names)} propert(ies) on the first row, as the server spells them:")
+    for start in range(0, len(names), 6):
+        note("    " + ", ".join(names[start : start + 6]))
+    if wanted in names:
+        note(f"  '{wanted}' IS present — the query name is right and the refusal is about something else.")
+        return
+    variants = [n for n in names if n.lower() == wanted.lower()]
+    if variants:
+        note(f"  '{wanted}' is ABSENT; the server spells it {variants[0]!r}. OData names are case-sensitive.")
+    else:
+        note(f"  '{wanted}' is ABSENT, and no case variant exists either.")
+        note("  Nothing here can be filtered or sorted as 'Id' — the paging key has to change.")
 
 
 def diagnose(transport: Transport, service: ODataService, entity_set: str, page_size: int) -> None:
@@ -170,15 +248,26 @@ def diagnose(transport: Transport, service: ODataService, entity_set: str, page_
         ("$filter + $orderby", "?$filter=Id%20gt%200&$orderby=Id&$top=1"),
         (f"full query, $top={page_size}", f"?$filter=Id%20gt%200&$orderby=Id&$top={page_size}"),
         ("$inlinecount", "?$top=0&$inlinecount=allpages"),
+        # No query options at all. If Id cannot be filtered or sorted on this
+        # farm, this is the only remaining way to walk the list: take the
+        # server's own default page and follow the continuation it hands back.
+        ("server-driven paging (no options)", ""),
     ]
 
     note(f"\ndiagnosing entity set {entity_set!r} — {len(ladder)} requests")
     note(f"  base: {base}")
     note("")
     results: dict[str, int] = {}
+    first_row = b""
+    continuation: str | None = None
     for name, query in ladder:
         url = base + query
-        status, detail = probe(transport, url)
+        status, detail, body = probe(transport, url)
+        if name == "bare" and 200 <= status < 300:
+            first_row = body
+        if name.startswith("server-driven") and 200 <= status < 300:
+            continuation = next_link(body)
+            detail += " — continuation offered" if continuation else " — NO continuation link"
         results[name] = status
         verdict = "ok  " if 200 <= status < 300 else "FAIL"
         note(f"  {verdict} {status:>3}  {name}")
@@ -189,9 +278,28 @@ def diagnose(transport: Transport, service: ODataService, entity_set: str, page_
         note(f"            {detail[:300]}")
     note("")
 
+    if first_row:
+        report_property_names(first_row)
+        note("")
+
     ok = lambda name: 200 <= results.get(name, 0) < 300  # noqa: E731
 
-    if not ok("bare"):
+    if ok("bare") and not ok("$select=Id only") and not ok("$filter only"):
+        note("  VERDICT: the collection reads, but every query naming 'Id' is refused.")
+        note("  Compare the property list above with what the queries ask for. If")
+        note("  'Id' is not in it, $metadata and this service disagree and the")
+        note("  service wins — check the metadata came from this same host.")
+        if continuation:
+            note("")
+            note("  A continuation link WAS offered, so this list can be walked with no")
+            note("  $filter and no $orderby: take the server's default page and follow")
+            note("  __next until it stops. That is the fix, and it needs no key at all.")
+        else:
+            note("")
+            note("  No continuation link was offered either, so server-driven paging")
+            note("  cannot replace Id paging here. Whatever the server calls its key,")
+            note("  in the property list above, is the only way through.")
+    elif not ok("bare"):
         note("  VERDICT: the plainest possible read of this collection fails, so this")
         note("  is not about paging. If '$select=Id only' passed, one of the columns")
         note("  cannot be serialised by ListData.svc and $select is the way around it.")

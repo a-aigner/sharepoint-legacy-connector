@@ -172,15 +172,21 @@ def diagnose(transport: Transport, service: ODataService, entity_set: str, page_
         ("$inlinecount", "?$top=0&$inlinecount=allpages"),
     ]
 
-    note(f"\ndiagnosing {entity_set} — {len(ladder)} requests")
+    note(f"\ndiagnosing entity set {entity_set!r} — {len(ladder)} requests")
+    note(f"  base: {base}")
     note("")
     results: dict[str, int] = {}
     for name, query in ladder:
-        status, detail = probe(transport, base + query)
+        url = base + query
+        status, detail = probe(transport, url)
         results[name] = status
         verdict = "ok  " if 200 <= status < 300 else "FAIL"
         note(f"  {verdict} {status:>3}  {name}")
-        note(f"            {detail[:200]}")
+        # The URL belongs in the output, not behind -v: when a server denies a
+        # property its own schema declares, the first thing to check is that the
+        # request went where we think it did.
+        note(f"            GET {url}")
+        note(f"            {detail[:300]}")
     note("")
 
     ok = lambda name: 200 <= results.get(name, 0) < 300  # noqa: E731
@@ -618,7 +624,11 @@ def main() -> int:
     service = ODataService(transport, settings.base_url)
 
     try:
-        note("\n[1/4] reading the service document")
+        # --list-sets and --diagnose both stop after step 2. Labelling those runs
+        # "2/4" reads as a failure two steps into four, which is how the last one
+        # got reported.
+        steps = 2 if (args.list_sets or args.diagnose) else 4
+        note(f"\n[1/{steps}] reading the service document")
         available = service.entity_sets()
         note(f"      {len(available)} collection(s), served as {service.representation or 'atom'}")
 
@@ -629,7 +639,7 @@ def main() -> int:
             footer(transport, started)
             return 0
 
-        note("\n[2/4] resolving collection names")
+        note(f"\n[2/{steps}] resolving collection names")
         tickets_set = resolve_entity_set(service, args.tickets, available)
         comments_set = resolve_entity_set(service, args.comments, available)
         note(f"      tickets  -> {tickets_set}")
@@ -643,9 +653,9 @@ def main() -> int:
         tickets_path = args.out / "tickets.jsonl"
         comments_path = args.out / "comments.jsonl"
 
-        note(f"\n[3/4] pulling {tickets_set}")
+        note(f"\n[3/{steps}] pulling {tickets_set}")
         pull(service, tickets_set, tickets_path, page_size=args.page_size, limit=args.limit)
-        note(f"\n[4/4] pulling {comments_set}")
+        note(f"\n[4/{steps}] pulling {comments_set}")
         pull(service, comments_set, comments_path, page_size=args.page_size, limit=args.limit)
 
         if not args.no_join:

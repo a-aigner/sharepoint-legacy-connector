@@ -30,7 +30,7 @@ import time
 import traceback
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -202,6 +202,31 @@ def row_property_names(body: bytes) -> list[str]:
         return []
     ns = "{http://schemas.microsoft.com/ado/2007/08/dataservices}"
     return sorted({etree.QName(el).localname for el in root.iter() if str(el.tag).startswith(ns)})
+
+
+def deferred_property_names(body: bytes) -> list[str]:
+    """Properties that came back as ``{"__deferred": {"uri": ...}}``.
+
+    JSON only. The Atom representation expresses navigation as ``<link>``
+    elements rather than as properties, so there is nothing to report there and
+    an empty list is the honest answer.
+    """
+    text = body.decode("utf-8", "replace").strip()
+    if not text.startswith("{"):
+        return []
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    node = payload.get("d") if isinstance(payload, dict) else None
+    if isinstance(node, dict):
+        rows = node.get("results")
+        node = rows[0] if isinstance(rows, list) and rows else node
+    elif isinstance(node, list):
+        node = node[0] if node else None
+    if not isinstance(node, dict):
+        return []
+    return sorted(k for k, v in node.items() if isinstance(v, dict) and "__deferred" in v)
 
 
 def next_link(body: bytes) -> str | None:
@@ -401,9 +426,16 @@ class CollectionSchema:
     properties: list[str]
     key: str | None
     created: str | None
+    #: Navigation properties present only as ``__deferred`` URI stubs. These are
+    #: exactly the fields $expand can turn into content, and the only ones worth
+    #: spending an expansion on.
+    deferred: list[str] = field(default_factory=list)
 
     def describe(self) -> str:
-        return f"key={self.key or '-'} created={self.created or '-'} ({len(self.properties)} properties)"
+        stubs = f" {len(self.deferred)} stubs" if self.deferred else ""
+        return (
+            f"key={self.key or '-'} created={self.created or '-'} ({len(self.properties)} properties{stubs})"
+        )
 
 
 def discover_schema(
@@ -423,7 +455,27 @@ def discover_schema(
         properties=names,
         key=resolve_property(names, KEY_ALIASES),
         created=resolve_property(names, CREATED_ALIASES),
+        deferred=deferred_property_names(body),
     )
+
+
+def resolve_expansions(schema: CollectionSchema, spec: str | None) -> tuple[list[str], list[str]]:
+    """Turn ``--expand`` into the list actually worth sending.
+
+    Returns ``(wanted, unknown)``. Names are checked against the stubs the
+    collection really has, because ``$expand`` on a property an entity does not
+    define is a 400 for the whole page — one bad name would cost every row, not
+    just that field.
+    """
+    if not spec:
+        return [], []
+    if spec.strip().lower() == "auto":
+        return list(schema.deferred), []
+    asked = [name.strip() for name in spec.split(",") if name.strip()]
+    available = {name.lower(): name for name in schema.deferred}
+    wanted = [available[name.lower()] for name in asked if name.lower() in available]
+    unknown = [name for name in asked if name.lower() not in available]
+    return wanted, unknown
 
 
 #: Asked of the same collection in --diagnose, to show what language negotiation
@@ -543,6 +595,16 @@ def highest_id_on_disk(path: Path, key: str) -> int:
     return best
 
 
+def page_url(base: str, *, key: str | None, last_id: int, page_size: int, expand: Sequence[str]) -> str:
+    """One page's query. Key paging when a key exists, plus any expansions."""
+    options: list[str] = []
+    if key:
+        options += [f"$filter={key}%20gt%20{last_id}", f"$orderby={key}", f"$top={page_size}"]
+    if expand:
+        options.append("$expand=" + ",".join(expand))
+    return f"{base}?{'&'.join(options)}" if options else base
+
+
 def max_key(rows: Sequence[dict[str, Any]], key: str) -> int | None:
     values = [r[key] for r in rows if isinstance(r.get(key), int)]
     return max(values) if values else None
@@ -557,6 +619,7 @@ def pull(
     page_size: int,
     limit: int | None,
     skip_count: bool = False,
+    expand: Sequence[str] | None = None,
 ) -> int:
     """Page one collection to JSONL, resuming from whatever is already there.
 
@@ -613,11 +676,16 @@ def pull(
     if last_id:
         note(f"  resuming after {key} {last_id:,}")
 
+    expansions = list(expand or [])
+    if expansions:
+        note(f"  expanding: {', '.join(expansions)}")
+
     url: str | None = None
     if key:
-        url = f"{base}?$filter={key}%20gt%20{last_id}&$orderby={key}&$top={page_size}"
+        url = page_url(base, key=key, last_id=last_id, page_size=page_size, expand=expansions)
     else:
         note("  no key property on this collection — using server-driven paging")
+        url = page_url(base, key=None, last_id=0, page_size=page_size, expand=expansions)
 
     written = skipped = pages = 0
     started = time.monotonic()
@@ -630,6 +698,14 @@ def pull(
             try:
                 rows, continuation = fetch_page(transport, url)
             except ODataError as exc:
+                if pages == 0 and expansions:
+                    # $expand is optional data. Losing it costs some payload;
+                    # losing the run costs the extraction.
+                    note(f"  ! $expand({', '.join(expansions)}) was refused: {exc}")
+                    note("    retrying without it — the stub fields stay unresolved")
+                    expansions = []
+                    url = page_url(base, key=key, last_id=last_id, page_size=page_size, expand=[])
+                    continue
                 if pages == 0 and key:
                     # The key is named right for this service and still refused.
                     # Server-driven paging asks for nothing by name, so try it
@@ -637,7 +713,7 @@ def pull(
                     note(f"  ! key paging on {key!r} was refused: {exc}")
                     note("    falling back to server-driven paging (follow __next)")
                     key = None
-                    url = base
+                    url = page_url(base, key=None, last_id=0, page_size=page_size, expand=expansions)
                     continue
                 note(f"  ! failed on page {pages + 1} ({written:,} rows written, $top={page_size})")
                 note(f"    retry this query with: --diagnose --page-size {page_size}")
@@ -674,7 +750,7 @@ def pull(
                     note(f"  ! page {pages} did not advance past {key} {last_id} — stopping")
                     break
                 last_id = highest
-                url = f"{base}?$filter={key}%20gt%20{last_id}&$orderby={key}&$top={page_size}"
+                url = page_url(base, key=key, last_id=last_id, page_size=page_size, expand=expansions)
             else:
                 if not continuation:
                     break
@@ -1001,6 +1077,11 @@ def main() -> int:
     add("--diagnose", action="store_true", help="bisect the query options against the ticket list and exit")
     add("--no-join", action="store_true", help="skip the joined output file")
     add(
+        "--expand",
+        default=None,
+        help="'auto' for every navigation stub, or a comma-separated list. Default: none.",
+    )
+    add(
         "--no-count",
         action="store_true",
         help="skip the row count; it costs retries when the server refuses it",
@@ -1075,6 +1156,13 @@ def main() -> int:
         for schema in (ticket_schema, comment_schema):
             if schema.key is None:
                 note(f"      ! no key property found on {schema.entity_set} — server-driven paging only")
+            if schema.deferred:
+                note(f"      {schema.entity_set} stubs: {', '.join(schema.deferred)}")
+
+        ticket_expand, unknown = resolve_expansions(ticket_schema, args.expand)
+        comment_expand, unknown_c = resolve_expansions(comment_schema, args.expand)
+        for name in dict.fromkeys(unknown + unknown_c):
+            note(f"      ! --expand {name!r}: no such navigation property, ignored")
 
         tickets_path = args.out / "tickets.jsonl"
         comments_path = args.out / "comments.jsonl"
@@ -1088,6 +1176,7 @@ def main() -> int:
             page_size=args.page_size,
             limit=args.limit,
             skip_count=args.no_count,
+            expand=ticket_expand,
         )
         note(f"\n[4/{steps}] pulling {comments_set}")
         pull(
@@ -1098,6 +1187,7 @@ def main() -> int:
             page_size=args.page_size,
             limit=args.limit,
             skip_count=args.no_count,
+            expand=comment_expand,
         )
 
         if not args.no_join:

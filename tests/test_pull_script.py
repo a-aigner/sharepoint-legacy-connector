@@ -1,0 +1,160 @@
+"""Tests for ``scripts/pull_tickets_and_comments.py``.
+
+The script is not part of the package, so it is loaded by path. It has to be
+registered in ``sys.modules`` before execution because it defines a dataclass,
+and ``@dataclass`` resolves its module through ``sys.modules``.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+import pytest
+import responses
+
+from spconnect.config import Settings
+from spconnect.services.odata import ODataService
+from spconnect.transport import Transport
+
+SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "pull_tickets_and_comments.py"
+BASE = "http://sp"
+TICKET_URL = re.compile(r"http://sp/_vti_bin/ListData\.svc/Ticket(\?.*)?$")
+
+
+def load_script() -> Any:
+    spec = importlib.util.spec_from_file_location("pull_script", SCRIPT)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["pull_script"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture(scope="module")
+def pull_script() -> Any:
+    return load_script()
+
+
+@pytest.fixture
+def transport() -> Transport:
+    return Transport(Settings(base_url=BASE, auth_mode="anonymous", max_retries=1))
+
+
+@pytest.fixture
+def service(transport: Transport) -> ODataService:
+    return ODataService(transport, BASE)
+
+
+def row(ident: int) -> dict[str, Any]:
+    """A ticket row shaped like the real farm: scalars plus navigation stubs."""
+    return {
+        "Id": ident,
+        "Title": f"T{ident}",
+        "Created": "/Date(1320399285000)/",
+        "AssignedTo": {"__deferred": {"uri": f"{BASE}/x/AssignedTo"}},
+        "CreatedBy": {"__deferred": {"uri": f"{BASE}/x/CreatedBy"}},
+    }
+
+
+def feed(rows: list[dict[str, Any]]) -> str:
+    return json.dumps({"d": {"results": rows}})
+
+
+# --------------------------------------------------------------------------- #
+# discovery
+# --------------------------------------------------------------------------- #
+
+
+@responses.activate
+def test_schema_discovery_lists_navigation_stubs(pull_script: Any, transport: Transport, service: ODataService) -> None:
+    """The stubs are what $expand can fill in — the schema has to name them."""
+    responses.add(responses.GET, TICKET_URL, body=feed([row(1)]), content_type="application/json")
+
+    schema = pull_script.discover_schema(transport, service, "Ticket")
+
+    assert schema.key == "Id"
+    assert sorted(schema.deferred) == ["AssignedTo", "CreatedBy"]
+
+
+# --------------------------------------------------------------------------- #
+# expansion
+# --------------------------------------------------------------------------- #
+
+
+@responses.activate
+def test_pull_requests_the_expansions_it_was_given(
+    pull_script: Any, transport: Transport, service: ODataService, tmp_path: Path
+) -> None:
+    responses.add(responses.GET, TICKET_URL, body=feed([row(1)]), content_type="application/json")
+    responses.add(responses.GET, TICKET_URL, body=feed([]), content_type="application/json")
+
+    schema = pull_script.CollectionSchema(
+        entity_set="Ticket", properties=["Id"], key="Id", created="Created",
+        deferred=["AssignedTo", "CreatedBy"],
+    )
+    pull_script.pull(
+        transport, service, schema, tmp_path / "t.jsonl",
+        page_size=10, limit=None, skip_count=True, expand=["AssignedTo", "CreatedBy"],
+    )
+
+    assert any("$expand=AssignedTo,CreatedBy" in call.request.url for call in responses.calls)
+
+
+@responses.activate
+def test_pull_falls_back_when_the_server_refuses_the_expansion(
+    pull_script: Any, transport: Transport, service: ODataService, tmp_path: Path
+) -> None:
+    """A refused $expand must cost the expansion, not the extraction."""
+
+    def dispatch(request: Any) -> tuple[int, dict[str, str], str]:
+        if "$expand" in (request.url or ""):
+            return 400, {}, json.dumps({"error": {"message": {"value": "expand refused"}}})
+        return 200, {"Content-Type": "application/json"}, feed([row(1)] if "gt%200" in request.url else [])
+
+    responses.add_callback(responses.GET, TICKET_URL, callback=dispatch, content_type="application/json")
+
+    schema = pull_script.CollectionSchema(
+        entity_set="Ticket", properties=["Id"], key="Id", created="Created", deferred=["AssignedTo"],
+    )
+    written = pull_script.pull(
+        transport, service, schema, tmp_path / "t.jsonl",
+        page_size=10, limit=None, skip_count=True, expand=["AssignedTo"],
+    )
+
+    assert written == 1, "rows must still be extracted after the expansion is refused"
+    assert (tmp_path / "t.jsonl").exists()
+
+
+# --------------------------------------------------------------------------- #
+# choosing what to expand
+# --------------------------------------------------------------------------- #
+
+
+def schema_with(deferred: list[str], pull_script: Any) -> Any:
+    return pull_script.CollectionSchema(
+        entity_set="Ticket", properties=["Id"], key="Id", created="Created", deferred=deferred
+    )
+
+
+def test_auto_expands_exactly_the_stubs_that_exist(pull_script: Any) -> None:
+    schema = schema_with(["AssignedTo", "CreatedBy"], pull_script)
+    assert pull_script.resolve_expansions(schema, "auto") == (["AssignedTo", "CreatedBy"], [])
+
+
+def test_unknown_expansion_names_are_dropped_not_sent(pull_script: Any) -> None:
+    """Asking for a property the entity does not have earns a 400 for the whole
+    page, so an unknown name must never reach the query."""
+    schema = schema_with(["AssignedTo"], pull_script)
+    wanted, unknown = pull_script.resolve_expansions(schema, "AssignedTo,Nonexistent")
+    assert wanted == ["AssignedTo"]
+    assert unknown == ["Nonexistent"]
+
+
+def test_no_expansion_requested_means_none_sent(pull_script: Any) -> None:
+    schema = schema_with(["AssignedTo"], pull_script)
+    assert pull_script.resolve_expansions(schema, None) == ([], [])

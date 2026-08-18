@@ -293,9 +293,6 @@ def diagnose(transport: Transport, service: ODataService, entity_set: str, page_
         report_property_names(first_row)
         note("")
 
-    compare_languages(transport, service, entity_set)
-    note("")
-
     ok = lambda name: 200 <= results.get(name, 0) < 300  # noqa: E731
 
     if ok("bare") and not ok("$select=Id only") and not ok("$filter only"):
@@ -1020,7 +1017,14 @@ def main() -> int:
         note(f"      comments -> {comments_set}")
 
         if args.diagnose:
-            diagnose(transport, service, tickets_set, args.page_size)
+            # Both collections, not just tickets. The comment list is the larger
+            # of the two by an order of magnitude, so it is the one where a view
+            # threshold or an unqueryable column would actually bite, and it was
+            # going unprobed.
+            for entity_set in (tickets_set, comments_set):
+                diagnose(transport, service, entity_set, args.page_size)
+            compare_languages(transport, service, tickets_set)
+            note("")
             footer(transport, started)
             return 0
 

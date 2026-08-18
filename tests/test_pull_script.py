@@ -158,3 +158,75 @@ def test_unknown_expansion_names_are_dropped_not_sent(pull_script: Any) -> None:
 def test_no_expansion_requested_means_none_sent(pull_script: Any) -> None:
     schema = schema_with(["AssignedTo"], pull_script)
     assert pull_script.resolve_expansions(schema, None) == ([], [])
+
+
+# --------------------------------------------------------------------------- #
+# a page too large for the server to answer in time
+# --------------------------------------------------------------------------- #
+
+
+def size_limited_farm(max_top: int) -> Any:
+    """Answers only pages of at most ``max_top`` rows; larger ones never complete.
+
+    A read timeout and an exhausted 5xx retry arrive identically at this layer —
+    the request did not complete — so a 500 stands in for the farm's 120-second
+    ReadTimeout without making the test wait.
+    """
+    rows = [row(i) for i in range(1, 13)]
+
+    def dispatch(request: Any) -> tuple[int, dict[str, str], str]:
+        url = request.url or ""
+        top_match = re.search(r"\$top=(\d+)", url)
+        top = int(top_match.group(1)) if top_match else 1000   # server-driven default
+        if top > max_top:
+            return 500, {}, "timed out"
+        after_match = re.search(r"gt%20(\d+)", url)
+        after = int(after_match.group(1)) if after_match else 0
+        page = [r for r in rows if r["Id"] > after][:top]
+        return 200, {"Content-Type": "application/json"}, feed(page)
+
+    return dispatch
+
+
+@responses.activate
+def test_page_size_halves_until_the_server_can_answer(
+    pull_script: Any, transport: Transport, service: ODataService, tmp_path: Path
+) -> None:
+    responses.add_callback(responses.GET, TICKET_URL, callback=size_limited_farm(100),
+                           content_type="application/json")
+    schema = pull_script.CollectionSchema(
+        entity_set="Ticket", properties=["Id"], key="Id", created="Created"
+    )
+
+    written = pull_script.pull(
+        transport, service, schema, tmp_path / "t.jsonl",
+        page_size=400, limit=None, skip_count=True,
+    )
+
+    assert written == 12, "every row must still arrive after the page size is reduced"
+    tops = {int(m.group(1)) for c in responses.calls
+            if (m := re.search(r"\$top=(\d+)", c.request.url))}
+    assert 400 in tops and 100 in tops, f"expected 400 to be reduced toward 100, saw {sorted(tops)}"
+
+
+@responses.activate
+def test_page_size_reduction_stops_instead_of_looping_forever(
+    pull_script: Any, transport: Transport, service: ODataService, tmp_path: Path
+) -> None:
+    """A server that answers nothing must end the run, not shrink indefinitely."""
+    responses.add_callback(responses.GET, TICKET_URL, callback=size_limited_farm(0),
+                           content_type="application/json")
+    schema = pull_script.CollectionSchema(
+        entity_set="Ticket", properties=["Id"], key="Id", created="Created"
+    )
+
+    with pytest.raises(pull_script.PageUnavailable):
+        pull_script.pull(
+            transport, service, schema, tmp_path / "t.jsonl",
+            page_size=400, limit=None, skip_count=True,
+        )
+
+    tops = {int(m.group(1)) for c in responses.calls
+            if (m := re.search(r"\$top=(\d+)", c.request.url))}
+    assert min(tops) >= pull_script.MIN_PAGE_SIZE, f"went below the floor: {sorted(tops)}"
+    assert len(tops) <= 8, f"halving should terminate quickly, saw {sorted(tops)}"

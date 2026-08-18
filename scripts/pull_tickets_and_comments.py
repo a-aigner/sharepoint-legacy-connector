@@ -542,10 +542,25 @@ def parse_feed(body: bytes) -> tuple[list[dict[str, Any]], str | None]:
     return [r for r in rows if isinstance(r, dict)], next_url
 
 
+class PageUnavailable(ODataError):
+    """A page did not come back. ``status`` is 0 when the request never
+    completed at all — a read timeout, a connection failure, or 5xx that
+    outlasted the retries — as opposed to a status the server chose to send."""
+
+    def __init__(self, message: str, *, status: int) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+#: Halving stops here. Below this a page is small enough that the size is not
+#: what is wrong, and continuing to shrink only delays an honest failure.
+MIN_PAGE_SIZE = 25
+
+
 def fetch_page(transport: Transport, url: str) -> tuple[list[dict[str, Any]], str | None]:
     status, detail, body = probe(transport, url)
     if not (200 <= status < 300):
-        raise ODataError(f"HTTP {status} for {url}: {detail}")
+        raise PageUnavailable(f"HTTP {status} for {url}: {detail}", status=status)
     return parse_feed(body)
 
 
@@ -698,6 +713,17 @@ def pull(
             try:
                 rows, continuation = fetch_page(transport, url)
             except ODataError as exc:
+                # A request that never completed is a request that asked for too
+                # much. Halving the page attacks the actual cause; dropping
+                # $expand or the key filter would not, and this can strike on any
+                # page -- the farm answered four 500-row pages before the fifth
+                # exceeded its read timeout.
+                if getattr(exc, "status", None) == 0 and key and page_size // 2 >= MIN_PAGE_SIZE:
+                    page_size //= 2
+                    note(f"  ! page {pages + 1} did not complete: {exc}")
+                    note(f"    retrying the same range at $top={page_size}")
+                    url = page_url(base, key=key, last_id=last_id, page_size=page_size, expand=expansions)
+                    continue
                 if pages == 0 and expansions:
                     # $expand is optional data. Losing it costs some payload;
                     # losing the run costs the extraction.

@@ -424,3 +424,80 @@ def test_expansion_plan_collects_unknown_names_from_both(pull_script: Any) -> No
     )
 
     assert sorted(plan.unknown) == ["AlsoNope", "Nope"]
+
+
+# --------------------------------------------------------------------------- #
+# attachments reached through their item
+# --------------------------------------------------------------------------- #
+
+
+def test_attachment_navigation_url_goes_through_the_item(pull_script: Any, service: ODataService) -> None:
+    """The standalone Attachments set is not enumerable; the navigation from an
+    item is. An empty collection query means 'ask differently', not 'none exist'."""
+    assert pull_script.attachment_nav_url(service, "Ticket", 3) == (
+        "http://sp/_vti_bin/ListData.svc/Ticket(3)/Attachments"
+    )
+
+
+@responses.activate
+def test_attachments_via_navigation_collects_across_items(
+    pull_script: Any, transport: Transport, service: ODataService
+) -> None:
+    def dispatch(request: Any) -> tuple[int, dict[str, str], str]:
+        item = int(re.search(r"Ticket\((\d+)\)", request.url).group(1))
+        if item == 2:
+            return 200, {"Content-Type": "application/json"}, json.dumps({"d": {"results": []}})
+        return 200, {"Content-Type": "application/json"}, json.dumps(
+            {"d": {"results": [{"EntitySet": "Ticket", "ItemId": item, "Name": f"f{item}.pdf"}]}}
+        )
+
+    responses.add_callback(
+        responses.GET, re.compile(r"http://sp/_vti_bin/ListData\.svc/Ticket\(\d+\)/Attachments"),
+        callback=dispatch, content_type="application/json",
+    )
+
+    found = pull_script.attachments_via_navigation(transport, service, "Ticket", [1, 2, 3])
+
+    assert [r["Name"] for r in found] == ["f1.pdf", "f3.pdf"]
+
+
+@responses.activate
+def test_attachments_via_navigation_survives_a_failing_item(
+    pull_script: Any, transport: Transport, service: ODataService
+) -> None:
+    """One unreadable ticket must not end the survey."""
+    def dispatch(request: Any) -> tuple[int, dict[str, str], str]:
+        if "Ticket(2)" in (request.url or ""):
+            return 500, {}, "boom"
+        return 200, {"Content-Type": "application/json"}, json.dumps(
+            {"d": {"results": [{"EntitySet": "Ticket", "ItemId": 1, "Name": "ok.pdf"}]}}
+        )
+
+    responses.add_callback(
+        responses.GET, re.compile(r"http://sp/_vti_bin/ListData\.svc/Ticket\(\d+\)/Attachments"),
+        callback=dispatch, content_type="application/json",
+    )
+
+    found = pull_script.attachments_via_navigation(transport, service, "Ticket", [1, 2])
+
+    assert [r["Name"] for r in found] == ["ok.pdf"]
+
+
+@responses.activate
+def test_fetch_attachment_rejects_an_odata_envelope_posing_as_a_file(
+    pull_script: Any, transport: Transport
+) -> None:
+    """A 200 is not proof of a file. SharePoint answers an unsupported media
+    request with an OData envelope, and a sign-in redirect lands as HTML —
+    both would otherwise be reported as the attachment."""
+    def dispatch(request: Any) -> tuple[int, dict[str, str], bytes]:
+        if "$value" in (request.url or ""):
+            return 200, {"Content-Type": "application/json"}, b'{"d": {"results": []}}'
+        return 200, {"Content-Type": "application/pdf"}, b"%PDF-1.4 real"
+
+    responses.add_callback(responses.GET, ATTACH_URL, callback=dispatch)
+
+    result = pull_script.fetch_attachment(transport, BASE, "Ticket", 3, "x.pdf", save_to=None)
+
+    assert result["via"] == "direct", "the JSON envelope must not be accepted as the file"
+    assert result["bytes"] == 13

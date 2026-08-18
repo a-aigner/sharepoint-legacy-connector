@@ -923,8 +923,57 @@ def attachment_urls(web_url: str, entity_set: str, item_id: int, name: str) -> t
     return media, direct
 
 
+def attachment_nav_url(service: ODataService, entity_set: str, item_id: int) -> str:
+    """``…/Ticket(3)/Attachments`` — the navigation from an item to its files."""
+    return f"{service.endpoint}/{quote(entity_set, safe='')}({int(item_id)})/{DEFAULT_ATTACHMENTS}"
+
+
+def attachments_via_navigation(
+    transport: Transport,
+    service: ODataService,
+    entity_set: str,
+    item_ids: Sequence[int],
+) -> list[dict[str, Any]]:
+    """Attachment entries for the given items, asked one item at a time.
+
+    The standalone ``Attachments`` set exists in ``$metadata`` because the
+    association needs a target, but this build does not enumerate it — a query
+    against it returns an empty feed with no properties at all, which is not the
+    same as there being no attachments. Going through the item works.
+
+    One item per request, so this is for sampling, not for a full inventory. An
+    item that cannot be read is skipped rather than ending the survey.
+    """
+    found: list[dict[str, Any]] = []
+    for item_id in item_ids:
+        try:
+            rows, _ = fetch_page(transport, attachment_nav_url(service, entity_set, item_id))
+        except (ODataError, TransportError):
+            continue
+        found.extend(rows)
+    return found
+
+
 #: Enough of a file to identify it without pulling a 200 MB video across the wire.
 PROBE_BYTES = 2 * 1024 * 1024
+
+
+def looks_like_file(payload: bytes, content_type: str, name: str) -> bool:
+    """Is this the attachment, or a document about the attachment?
+
+    Only two shapes are rejected, both of which arrive with status 200: an OData
+    envelope, which is what an unsupported media request returns, and an HTML
+    page, which is what a sign-in redirect returns. Everything else is believed —
+    guessing harder would start rejecting real files.
+    """
+    if not payload:
+        return False
+    head = payload.lstrip()[:512].lower()
+    if "json" in content_type.lower() and head.startswith((b"{", b"[")):
+        return Path(name).suffix.lower() == ".json"
+    if "html" in content_type.lower() or head.startswith((b"<!doctype html", b"<html")):
+        return Path(name).suffix.lower() in (".html", ".htm")
+    return True
 
 
 def fetch_attachment(
@@ -964,6 +1013,13 @@ def fetch_attachment(
             result["error"] = f"HTTP {response.status_code}"
             continue
         payload = response.content[:PROBE_BYTES]
+        content_type = response.headers.get("Content-Type", "")
+        if not looks_like_file(payload, content_type, name):
+            # 200 is not proof of a file. An unsupported media request comes back
+            # as an OData envelope and a sign-in redirect lands as HTML, both with
+            # a perfectly good status.
+            result["error"] = f"{content_type or 'unknown type'} is not the file"
+            continue
         result.update(
             ok=True,
             via=label,
@@ -989,6 +1045,7 @@ def survey_attachments(
     *,
     page_size: int,
     sample: int,
+    probe_items: int = 200,
 ) -> None:
     """Inventory every attachment, then prove a sample of them can be fetched.
 
@@ -1010,8 +1067,33 @@ def survey_attachments(
 
     rows = read_jsonl(path)
     if not rows:
-        note("  no attachments on this web")
-        return
+        # An empty feed here is not evidence of absence. This build does not
+        # enumerate the standalone Attachments set -- the sample row came back
+        # with no properties at all -- so ask through the items instead.
+        note("  the Attachments collection returned nothing, and it is not")
+        note("  enumerable on this build. Asking through the tickets instead.")
+        ticket_rows = read_jsonl(out_dir / "tickets.jsonl")
+        if not ticket_rows:
+            note(f"  ! need {out_dir / 'tickets.jsonl'} to sample from — run the ticket pull first")
+            return
+        key = resolve_property(ticket_rows[0], KEY_ALIASES)
+        if key is None:
+            note("  ! no key property on the ticket rows on disk")
+            return
+        ids = [r[key] for r in ticket_rows if isinstance(r.get(key), int)]
+        # Spread the probe across the history: attachment habits change over
+        # fifteen years, and the first N ids would only describe 2011.
+        step = max(1, len(ids) // max(1, probe_items))
+        probed = ids[::step][:probe_items]
+        note(f"  probing {len(probed)} tickets spread across {len(ids):,}")
+        rows = attachments_via_navigation(transport, service, "Ticket", probed)
+        if not rows:
+            note(f"  none of those {len(probed)} tickets has an attachment.")
+            note("  That is a sample, not the corpus — raise --attachment-probe to widen it.")
+            return
+        carriers = len({r.get("ItemId") for r in rows})
+        note(f"  found {len(rows)} attachment(s) on {carriers} of them")
+        write_jsonl(path, rows)
 
     kinds: Counter[str] = Counter()
     per_list: Counter[str] = Counter()
@@ -1070,6 +1152,14 @@ def survey_attachments(
 # --------------------------------------------------------------------------- #
 # joining
 # --------------------------------------------------------------------------- #
+
+
+def write_jsonl(path: Path, rows: Sequence[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False, default=str))
+            handle.write("\n")
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -1388,6 +1478,12 @@ def main() -> int:
         help="inventory attachments and verify a sample can be fetched, then exit",
     )
     add(
+        "--attachment-probe",
+        type=int,
+        default=200,
+        help="tickets to ask directly when the Attachments collection is not enumerable",
+    )
+    add(
         "--attachment-sample",
         type=int,
         default=8,
@@ -1454,6 +1550,7 @@ def main() -> int:
                 args.out,
                 page_size=args.page_size,
                 sample=args.attachment_sample,
+                probe_items=args.attachment_probe,
             )
             footer(transport, started)
             return 0

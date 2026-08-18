@@ -103,6 +103,19 @@ def resolve_entity_set(service: ODataService, wanted: str, available: list[str])
     )
 
 
+def resolve_optional_entity_set(service: ODataService, wanted: str, available: list[str]) -> str | None:
+    """Like :func:`resolve_entity_set`, but absence is an answer rather than an exit.
+
+    The ticket and comment collections are the job; the user list only puts names
+    to the numeric ``CreatedById`` values. A farm that does not expose it should
+    cost the author names, not the extraction.
+    """
+    try:
+        return resolve_entity_set(service, wanted, available)
+    except SystemExit:
+        return None
+
+
 # --------------------------------------------------------------------------- #
 # query diagnosis
 # --------------------------------------------------------------------------- #
@@ -793,6 +806,35 @@ def _at_or_below(row: dict[str, Any], key: str, ceiling: int) -> bool:
     return isinstance(value, int) and value <= ceiling
 
 
+DEFAULT_USERS = "UserInformationList"
+
+
+def pull_users(
+    transport: Transport,
+    service: ODataService,
+    available: list[str],
+    path: Path,
+    *,
+    page_size: int,
+) -> int | None:
+    """Put names to the numeric author ids. Returns ``None`` if the list is absent.
+
+    Every comment carries ``CreatedById`` and nothing else about its author, and
+    §6.3 of the pipeline specification classifies a conversation partly by who
+    wrote each turn. The corpus has 59 distinct comment authors across 102,625
+    comments, so resolving them through ``$expand`` would be a hundred thousand
+    lookups to learn fifty-nine facts. This list answers it in one pass.
+    """
+    entity_set = resolve_optional_entity_set(service, DEFAULT_USERS, available)
+    if entity_set is None:
+        note(f"  {DEFAULT_USERS} is not exposed on this web — author ids stay unresolved")
+        return None
+
+    schema = discover_schema(transport, service, entity_set)
+    note(f"  {entity_set}: {schema.describe()}")
+    return pull(transport, service, schema, path, page_size=page_size, limit=None, skip_count=True)
+
+
 # --------------------------------------------------------------------------- #
 # joining
 # --------------------------------------------------------------------------- #
@@ -1102,6 +1144,7 @@ def main() -> int:
     add("--list-sets", action="store_true", help="print every collection and exit")
     add("--diagnose", action="store_true", help="bisect the query options against the ticket list and exit")
     add("--no-join", action="store_true", help="skip the joined output file")
+    add("--no-users", action="store_true", help="skip the user list pull")
     add(
         "--expand",
         default=None,
@@ -1215,6 +1258,10 @@ def main() -> int:
             skip_count=args.no_count,
             expand=comment_expand,
         )
+
+        if not args.no_users:
+            note("\nresolving author ids")
+            pull_users(transport, service, available, args.out / "users.jsonl", page_size=args.page_size)
 
         if not args.no_join:
             note("\njoining")

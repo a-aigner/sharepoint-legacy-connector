@@ -230,3 +230,66 @@ def test_page_size_reduction_stops_instead_of_looping_forever(
             if (m := re.search(r"\$top=(\d+)", c.request.url))}
     assert min(tops) >= pull_script.MIN_PAGE_SIZE, f"went below the floor: {sorted(tops)}"
     assert len(tops) <= 8, f"halving should terminate quickly, saw {sorted(tops)}"
+
+
+# --------------------------------------------------------------------------- #
+# the user list
+# --------------------------------------------------------------------------- #
+
+
+def test_optional_entity_set_resolves_when_present(pull_script: Any, service: ODataService) -> None:
+    available = ["Ticket", "TicketComment", "UserInformationList"]
+    assert pull_script.resolve_optional_entity_set(service, "UserInformationList", available) == (
+        "UserInformationList"
+    )
+
+
+def test_optional_entity_set_is_case_insensitive(pull_script: Any, service: ODataService) -> None:
+    available = ["Ticket", "userinformationlist"]
+    assert pull_script.resolve_optional_entity_set(service, "UserInformationList", available) == (
+        "userinformationlist"
+    )
+
+
+def test_optional_entity_set_returns_none_rather_than_exiting(
+    pull_script: Any, service: ODataService
+) -> None:
+    """A farm without the list must cost the author names, not the extraction.
+
+    resolve_entity_set raises SystemExit, which is right for the ticket list and
+    wrong for an optional one.
+    """
+    assert pull_script.resolve_optional_entity_set(service, "UserInformationList", ["Ticket"]) is None
+
+
+@responses.activate
+def test_pull_users_writes_the_directory_when_the_list_exists(
+    pull_script: Any, transport: Transport, service: ODataService, tmp_path: Path
+) -> None:
+    users = re.compile(r"http://sp/_vti_bin/ListData\.svc/UserInformationList(\?.*)?$")
+    responses.add(responses.GET, users, content_type="application/json",
+                  body=json.dumps({"d": {"results": [{"Id": 13, "Name": "A. Schoene"}]}}))
+    responses.add(responses.GET, users, content_type="application/json",
+                  body=json.dumps({"d": {"results": [{"Id": 13, "Name": "A. Schoene"}]}}))
+    responses.add(responses.GET, users, body=feed([]), content_type="application/json")
+
+    out = tmp_path / "users.jsonl"
+    written = pull_script.pull_users(
+        transport, service, ["Ticket", "UserInformationList"], out, page_size=100
+    )
+
+    assert written == 1
+    assert json.loads(out.read_text(encoding="utf-8").splitlines()[0])["Name"] == "A. Schoene"
+
+
+@responses.activate
+def test_pull_users_is_skipped_when_the_list_is_absent(
+    pull_script: Any, transport: Transport, service: ODataService, tmp_path: Path
+) -> None:
+    out = tmp_path / "users.jsonl"
+
+    written = pull_script.pull_users(transport, service, ["Ticket"], out, page_size=100)
+
+    assert written is None
+    assert not out.exists(), "no collection means no file, not an empty one"
+    assert not responses.calls, "nothing should be requested for a collection that is not there"

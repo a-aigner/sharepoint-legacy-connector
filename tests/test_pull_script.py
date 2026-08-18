@@ -383,3 +383,44 @@ def test_fetch_attachment_saves_the_bytes_when_asked(
     saved = tmp_path / "42__logs.zip"
     assert saved.read_bytes() == b"PK\x03\x04payload"
     assert result["kind"] == "archive"
+
+
+# --------------------------------------------------------------------------- #
+# expansion is per collection
+# --------------------------------------------------------------------------- #
+
+
+def test_expand_applies_to_tickets_and_leaves_comments_alone(pull_script: Any) -> None:
+    """The measured reason: tickets expanded at 42-53 rows/s and finished, the
+    same expansion on comments ran at 5 rows/s and timed out. One flag driving
+    both collections cannot express that."""
+    tickets = schema_with(["AssignedTo", "CreatedBy"], pull_script)
+    comments = schema_with(["CreatedBy", "EmailReceiver"], pull_script)
+
+    plan = pull_script.expansion_plan(tickets, comments, tickets_spec="auto", comments_spec=None)
+
+    assert plan.tickets == ["AssignedTo", "CreatedBy"]
+    assert plan.comments == []
+
+
+def test_comments_can_still_be_expanded_when_asked_explicitly(pull_script: Any) -> None:
+    tickets = schema_with(["AssignedTo"], pull_script)
+    comments = schema_with(["CreatedBy", "EmailReceiver"], pull_script)
+
+    plan = pull_script.expansion_plan(
+        tickets, comments, tickets_spec=None, comments_spec="EmailReceiver"
+    )
+
+    assert plan.tickets == []
+    assert plan.comments == ["EmailReceiver"]
+
+
+def test_expansion_plan_collects_unknown_names_from_both(pull_script: Any) -> None:
+    tickets = schema_with(["AssignedTo"], pull_script)
+    comments = schema_with(["CreatedBy"], pull_script)
+
+    plan = pull_script.expansion_plan(
+        tickets, comments, tickets_spec="AssignedTo,Nope", comments_spec="AlsoNope"
+    )
+
+    assert sorted(plan.unknown) == ["AlsoNope", "Nope"]

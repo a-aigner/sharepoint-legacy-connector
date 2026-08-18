@@ -493,6 +493,42 @@ def resolve_expansions(schema: CollectionSchema, spec: str | None) -> tuple[list
     return wanted, unknown
 
 
+@dataclass
+class ExpansionPlan:
+    """What to expand, per collection, plus names no collection recognised."""
+
+    tickets: list[str] = field(default_factory=list)
+    comments: list[str] = field(default_factory=list)
+    unknown: list[str] = field(default_factory=list)
+
+
+def expansion_plan(
+    tickets: CollectionSchema,
+    comments: CollectionSchema,
+    *,
+    tickets_spec: str | None,
+    comments_spec: str | None,
+) -> ExpansionPlan:
+    """Resolve expansions separately for the two collections.
+
+    They behave nothing alike on this farm. The ticket list expanded at 42-53
+    rows/s and completed; the same expansion on the comment list ran at 5 rows/s
+    and exceeded the read timeout, because the server resolves a lookup per row
+    and there are 102,625 comment rows against 14,729 tickets.
+
+    Comments also have little to gain: their authors are 59 distinct users, which
+    the user list answers in one pass rather than a hundred thousand lookups. So
+    --expand drives tickets, and expanding comments has to be asked for.
+    """
+    ticket_names, ticket_unknown = resolve_expansions(tickets, tickets_spec)
+    comment_names, comment_unknown = resolve_expansions(comments, comments_spec)
+    return ExpansionPlan(
+        tickets=ticket_names,
+        comments=comment_names,
+        unknown=list(dict.fromkeys(ticket_unknown + comment_unknown)),
+    )
+
+
 #: Asked of the same collection in --diagnose, to show what language negotiation
 #: actually changes on this farm before anyone depends on it.
 COMPARED_LANGUAGES: tuple[str | None, ...] = (None, "en-US", "de-DE")
@@ -1340,6 +1376,11 @@ def main() -> int:
     add("--list-sets", action="store_true", help="print every collection and exit")
     add("--diagnose", action="store_true", help="bisect the query options against the ticket list and exit")
     add("--no-join", action="store_true", help="skip the joined output file")
+    add(
+        "--expand-comments",
+        default=None,
+        help="expand the comment list too. Rarely wanted: it is what timed the last run out.",
+    )
     add("--no-users", action="store_true", help="skip the user list pull")
     add(
         "--attachments",
@@ -1355,7 +1396,7 @@ def main() -> int:
     add(
         "--expand",
         default=None,
-        help="'auto' for every navigation stub, or a comma-separated list. Default: none.",
+        help="tickets only: 'auto' for every navigation stub, or a comma list. Default: none.",
     )
     add(
         "--no-count",
@@ -1448,9 +1489,13 @@ def main() -> int:
             if schema.deferred:
                 note(f"      {schema.entity_set} stubs: {', '.join(schema.deferred)}")
 
-        ticket_expand, unknown = resolve_expansions(ticket_schema, args.expand)
-        comment_expand, unknown_c = resolve_expansions(comment_schema, args.expand)
-        for name in dict.fromkeys(unknown + unknown_c):
+        plan = expansion_plan(
+            ticket_schema,
+            comment_schema,
+            tickets_spec=args.expand,
+            comments_spec=args.expand_comments,
+        )
+        for name in plan.unknown:
             note(f"      ! --expand {name!r}: no such navigation property, ignored")
 
         tickets_path = args.out / "tickets.jsonl"
@@ -1465,7 +1510,7 @@ def main() -> int:
             page_size=args.page_size,
             limit=args.limit,
             skip_count=args.no_count,
-            expand=ticket_expand,
+            expand=plan.tickets,
         )
         note(f"\n[4/{steps}] pulling {comments_set}")
         pull(
@@ -1476,7 +1521,7 @@ def main() -> int:
             page_size=args.page_size,
             limit=args.limit,
             skip_count=args.no_count,
-            expand=comment_expand,
+            expand=plan.comments,
         )
 
         if not args.no_users:

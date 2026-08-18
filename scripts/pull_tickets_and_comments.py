@@ -165,7 +165,13 @@ def probe(transport: Transport, url: str, *, language: str | None = None) -> tup
         return 0, f"{type(exc).__name__}: {exc}", b""
     if response.status_code >= 400:
         return response.status_code, error_message(response.content), response.content
-    return response.status_code, f"{len(response.content):,} bytes", response.content
+    size = len(response.content)
+    detail = f"{size:,} bytes"
+    if size <= 120:
+        preview = response.content.decode("utf-8", "replace").strip()
+        if preview:
+            detail += f" — {preview}"
+    return response.status_code, detail, response.content
 
 
 def row_property_names(body: bytes) -> list[str]:
@@ -258,7 +264,14 @@ def diagnose(transport: Transport, service: ODataService, entity_set: str, page_
         ("$filter only", "?$filter=Id%20gt%200&$top=1"),
         ("$filter + $orderby", "?$filter=Id%20gt%200&$orderby=Id&$top=1"),
         (f"full query, $top={page_size}", f"?$filter=Id%20gt%200&$orderby=Id&$top={page_size}"),
-        ("$inlinecount", "?$top=0&$inlinecount=allpages"),
+        # Counting, three ways. count() reaches for /$count first and only falls
+        # back to $inlinecount, so probing the fallback alone tests the wrong
+        # thing. And $top=1 alongside $top=0 separates "this service will not
+        # count" from "this service will not accept $top=0", which are different
+        # faults with the same symptom.
+        ("/$count (tried first)", "/$count"),
+        ("$inlinecount, $top=0", "?$top=0&$inlinecount=allpages"),
+        ("$inlinecount, $top=1", "?$top=1&$inlinecount=allpages"),
         # No query options at all. If Id cannot be filtered or sorted on this
         # farm, this is the only remaining way to walk the list: take the
         # server's own default page and follow the continuation it hands back.
@@ -294,6 +307,15 @@ def diagnose(transport: Transport, service: ODataService, entity_set: str, page_
         note("")
 
     ok = lambda name: 200 <= results.get(name, 0) < 300  # noqa: E731
+
+    counts = ("/$count (tried first)", "$inlinecount, $top=0", "$inlinecount, $top=1")
+    if not any(ok(name) for name in counts):
+        note("  Counting is refused every way. That is cosmetic — the pull catches it")
+        note("  and reports the total as unknown; it does not stop the extraction.")
+    elif not ok("$inlinecount, $top=0") and ok("$inlinecount, $top=1"):
+        note("  $inlinecount works but $top=0 does not: this build rejects a zero page")
+        note("  rather than refusing to count. Also cosmetic.")
+    note("")
 
     if ok("bare") and not ok("$select=Id only") and not ok("$filter only"):
         note("  VERDICT: the collection reads, but every query naming 'Id' is refused.")
@@ -534,6 +556,7 @@ def pull(
     *,
     page_size: int,
     limit: int | None,
+    skip_count: bool = False,
 ) -> int:
     """Page one collection to JSONL, resuming from whatever is already there.
 
@@ -556,13 +579,22 @@ def pull(
     key = schema.key
     last_id = highest_id_on_disk(path, key) if key else 0
 
-    try:
-        expected = f"{service.count(entity_set):,}"
-    except ODataError:
-        # A count over the view threshold throws where a paged read does not.
-        # Not knowing the total is a cosmetic loss; refusing to run over it
-        # would be a real one.
-        expected = "unknown (count refused)"
+    if skip_count:
+        expected = "not counted (--no-count)"
+    else:
+        try:
+            expected = f"{service.count(entity_set):,}"
+        except (ODataError, RetryableTransportError):
+            # A count over the view threshold throws where a paged read does not.
+            # Not knowing the total is a cosmetic loss; refusing to run over it
+            # would be a real one.
+            #
+            # RetryableTransportError belongs here as much as ODataError: this
+            # farm answers a count on the 100k comment list with HTTP 500, which
+            # is retryable, so it arrives as a transport failure rather than an
+            # OData one. Catching only ODataError let a cosmetic step abort the
+            # whole extraction.
+            expected = "unknown (count refused)"
 
     # Switching --language renames the key, and a resume scan looking for the new
     # name in a file written under the old one finds nothing, restarts at zero and
@@ -968,6 +1000,11 @@ def main() -> int:
     add("--list-sets", action="store_true", help="print every collection and exit")
     add("--diagnose", action="store_true", help="bisect the query options against the ticket list and exit")
     add("--no-join", action="store_true", help="skip the joined output file")
+    add(
+        "--no-count",
+        action="store_true",
+        help="skip the row count; it costs retries when the server refuses it",
+    )
     add("--language", default=None, help="Accept-Language for every request, e.g. en-US (default: unset)")
     add("--env-file", default=None, help="path to .env")
     add("-v", "--verbose", action="store_true", help="log every HTTP request and response")
@@ -1043,9 +1080,25 @@ def main() -> int:
         comments_path = args.out / "comments.jsonl"
 
         note(f"\n[3/{steps}] pulling {tickets_set}")
-        pull(transport, service, ticket_schema, tickets_path, page_size=args.page_size, limit=args.limit)
+        pull(
+            transport,
+            service,
+            ticket_schema,
+            tickets_path,
+            page_size=args.page_size,
+            limit=args.limit,
+            skip_count=args.no_count,
+        )
         note(f"\n[4/{steps}] pulling {comments_set}")
-        pull(transport, service, comment_schema, comments_path, page_size=args.page_size, limit=args.limit)
+        pull(
+            transport,
+            service,
+            comment_schema,
+            comments_path,
+            page_size=args.page_size,
+            limit=args.limit,
+            skip_count=args.no_count,
+        )
 
         if not args.no_join:
             note("\njoining")

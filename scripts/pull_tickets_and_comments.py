@@ -478,6 +478,28 @@ def fetch_page(transport: Transport, url: str) -> tuple[list[dict[str, Any]], st
     return parse_feed(body)
 
 
+class SchemaMismatch(ODataError):
+    """Rows already on disk were written under different property names."""
+
+
+def first_row_keys(path: Path) -> set[str]:
+    """Property names on the first usable row already on disk, if any."""
+    if not path.exists():
+        return set()
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                return set(row)
+    return set()
+
+
 def highest_id_on_disk(path: Path, key: str) -> int:
     """Resume point. Rows are written in key order, but scan rather than trust it.
 
@@ -544,6 +566,19 @@ def pull(
         # Not knowing the total is a cosmetic loss; refusing to run over it
         # would be a real one.
         expected = "unknown (count refused)"
+
+    # Switching --language renames the key, and a resume scan looking for the new
+    # name in a file written under the old one finds nothing, restarts at zero and
+    # appends the whole list a second time. Refuse instead of duplicating silently.
+    if key:
+        existing = first_row_keys(path)
+        if existing and key not in existing:
+            raise SchemaMismatch(
+                f"{path} holds rows without a {key!r} property "
+                f"(they have: {', '.join(sorted(existing)[:8])}). "
+                "The language changed between runs, so resuming would append every "
+                "row again. Delete that file, or pass a different --out."
+            )
 
     note(f"  {entity_set}: {expected} row(s) expected, {schema.describe()}")
     if last_id:
@@ -898,6 +933,13 @@ def explain_failure(exc: BaseException) -> list[str]:
             "survived all retries. If this is TLS, SP_ALLOW_LEGACY_TLS=true and",
             "SP_VERIFY_SSL=false are the two settings that matter.",
             "Rerun with -v to see how far the retries got.",
+        ]
+    if isinstance(exc, SchemaMismatch):
+        return [
+            "Nothing was written. The rows already in that file use different",
+            "property names than this run resolved, which happens when --language",
+            "changes between runs. Delete the file or use a different --out;",
+            "appending would have duplicated every row.",
         ]
     if isinstance(exc, ODataError):
         return [

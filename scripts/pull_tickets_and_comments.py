@@ -25,14 +25,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 import traceback
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from lxml import etree
 
@@ -836,6 +838,200 @@ def pull_users(
 
 
 # --------------------------------------------------------------------------- #
+# attachments
+# --------------------------------------------------------------------------- #
+
+DEFAULT_ATTACHMENTS = "Attachments"
+
+#: Extension groups worth telling apart. An archive is the interesting case: a
+#: zip of log files is a directory of evidence, not one opaque blob.
+FILE_KINDS: dict[str, tuple[str, ...]] = {
+    "archive": (".zip", ".rar", ".7z", ".tar", ".gz", ".tgz", ".cab"),
+    "document": (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".rtf", ".odt", ".msg", ".eml"),
+    "image": (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".heic"),
+    "text": (".txt", ".log", ".csv", ".xml", ".json", ".ini", ".cfg", ".yml", ".yaml"),
+    "video": (".mp4", ".avi", ".mov", ".mkv", ".wmv"),
+}
+
+
+def file_kind(name: str) -> str:
+    suffix = Path(name).suffix.lower()
+    for kind, suffixes in FILE_KINDS.items():
+        if suffix in suffixes:
+            return kind
+    return "other"
+
+
+def attachment_urls(web_url: str, entity_set: str, item_id: int, name: str) -> tuple[str, str]:
+    """The two ways SharePoint 2010 will hand over an attachment's bytes.
+
+    ``AttachmentsItem`` is a media link entry — ``HasStream`` is true — so the
+    entity carries only (EntitySet, ItemId, Name) and the content lives at a
+    separate media resource. Which of the two forms a given build serves is not
+    something to assume, so both are constructed and both get tried.
+
+    Two encoding traps, and neither produces a clean 404 when got wrong:
+
+    * A single quote terminates an OData string literal. ``O'Brien.pdf`` has to
+      become ``'O''Brien.pdf'`` or the key is malformed.
+    * Spaces and umlauts must be percent-encoded in both forms.
+    """
+    # The apostrophe stays literal. It is a legal path character, and doubling is
+    # how OData escapes it inside a string literal — percent-encoding the doubled
+    # pair as well leaves the service to decode and then un-double, which key
+    # parsers do not reliably do.
+    literal = quote(name, safe="'").replace("'", "''")
+    key = f"EntitySet='{quote(entity_set, safe='')}',ItemId={int(item_id)},Name='{literal}'"
+    media = f"{web_url}/_vti_bin/ListData.svc/{DEFAULT_ATTACHMENTS}({key})/$value"
+    direct = f"{web_url}/Lists/{quote(entity_set, safe='')}/Attachments/{int(item_id)}/{quote(name, safe='')}"
+    return media, direct
+
+
+#: Enough of a file to identify it without pulling a 200 MB video across the wire.
+PROBE_BYTES = 2 * 1024 * 1024
+
+
+def fetch_attachment(
+    transport: Transport,
+    web_url: str,
+    entity_set: str,
+    item_id: int,
+    name: str,
+    *,
+    save_to: Path | None,
+) -> dict[str, Any]:
+    """Try to actually retrieve one attachment. Reports rather than raises.
+
+    Both URL forms are attempted because which one a build serves is not
+    knowable in advance, and a failure of one is not a failure of the file.
+    Reading is capped at :data:`PROBE_BYTES`: the point is to prove the bytes are
+    reachable and see what they are, not to move the corpus.
+    """
+    media, direct = attachment_urls(web_url, entity_set, item_id, name)
+    result: dict[str, Any] = {
+        "item_id": item_id,
+        "name": name,
+        "kind": file_kind(name),
+        "ok": False,
+        "via": None,
+        "bytes": 0,
+        "content_type": None,
+        "error": None,
+    }
+    for label, url in (("media", media), ("direct", direct)):
+        try:
+            response = transport.request("GET", url, stream=True)
+        except TransportError as exc:
+            result["error"] = f"{type(exc).__name__}: {exc}"
+            continue
+        if response.status_code >= 400:
+            result["error"] = f"HTTP {response.status_code}"
+            continue
+        payload = response.content[:PROBE_BYTES]
+        result.update(
+            ok=True,
+            via=label,
+            bytes=len(payload),
+            content_type=response.headers.get("Content-Type"),
+            error=None,
+        )
+        if save_to is not None:
+            save_to.mkdir(parents=True, exist_ok=True)
+            # Attachment names repeat across tickets, so the item id has to be in
+            # the filename or one ticket's evidence silently overwrites another's.
+            safe = re.sub(r"[^\w.\- ]", "_", name).strip() or "attachment"
+            (save_to / f"{item_id}__{safe}").write_bytes(payload)
+        break
+    return result
+
+
+def survey_attachments(
+    transport: Transport,
+    service: ODataService,
+    available: list[str],
+    out_dir: Path,
+    *,
+    page_size: int,
+    sample: int,
+) -> None:
+    """Inventory every attachment, then prove a sample of them can be fetched.
+
+    Deliberately not a download pipeline. The question is whether the bytes are
+    reachable at all and what they are — a zip of log files is worth a different
+    plan from a folder of screenshots.
+    """
+    entity_set = resolve_optional_entity_set(service, DEFAULT_ATTACHMENTS, available)
+    if entity_set is None:
+        note(f"  {DEFAULT_ATTACHMENTS} is not exposed on this web")
+        return
+
+    path = out_dir / "attachments.jsonl"
+    schema = discover_schema(transport, service, entity_set)
+    note(f"  {entity_set}: {schema.describe()}")
+    # The key is (EntitySet, ItemId, Name) — there is no integer Id to page on,
+    # so this collection walks by continuation rather than by key.
+    pull(transport, service, schema, path, page_size=page_size, limit=None, skip_count=True)
+
+    rows = read_jsonl(path)
+    if not rows:
+        note("  no attachments on this web")
+        return
+
+    kinds: Counter[str] = Counter()
+    per_list: Counter[str] = Counter()
+    for r in rows:
+        kinds[file_kind(str(r.get("Name", "")))] += 1
+        per_list[str(r.get("EntitySet", "?"))] += 1
+    note(f"\n  {len(rows):,} attachment(s)")
+    note("  by list:  " + ", ".join(f"{k}={v:,}" for k, v in per_list.most_common()))
+    note("  by kind:  " + ", ".join(f"{k}={v:,}" for k, v in kinds.most_common()))
+    tickets_with = len({r.get("ItemId") for r in rows if r.get("EntitySet") == "Ticket"})
+    note(f"  tickets carrying at least one: {tickets_with:,}")
+
+    # One of each kind, so the check covers the formats rather than the first N
+    # rows, which on a sorted list would all be the same thing.
+    by_kind: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        by_kind[file_kind(str(r.get("Name", "")))].append(r)
+    picked: list[dict[str, Any]] = []
+    while len(picked) < sample and any(by_kind.values()):
+        for kind in list(by_kind):
+            if by_kind[kind] and len(picked) < sample:
+                picked.append(by_kind[kind].pop(0))
+
+    save_to = out_dir / "attachments_sample"
+    note(f"\n  fetching {len(picked)} of them into {save_to.name}/")
+    ok = 0
+    for r in picked:
+        item_id = r.get("ItemId")
+        name = str(r.get("Name", ""))
+        if not isinstance(item_id, int):
+            continue
+        outcome = fetch_attachment(
+            transport,
+            service.web_url,
+            str(r.get("EntitySet", "Ticket")),
+            item_id,
+            name,
+            save_to=save_to,
+        )
+        ok += 1 if outcome["ok"] else 0
+        status = f"ok via {outcome['via']}" if outcome["ok"] else f"FAILED {outcome['error']}"
+        note(
+            f"    [{outcome['kind']:<8}] {name[:44]:<44} {status} "
+            f"{format_bytes(outcome['bytes']) if outcome['ok'] else ''}"
+        )
+    note(
+        f"\n  {ok}/{len(picked)} retrieved. "
+        + (
+            "Attachment bytes are reachable over REST."
+            if ok
+            else "No form worked — the bytes are not reachable this way."
+        )
+    )
+
+
+# --------------------------------------------------------------------------- #
 # joining
 # --------------------------------------------------------------------------- #
 
@@ -1146,6 +1342,17 @@ def main() -> int:
     add("--no-join", action="store_true", help="skip the joined output file")
     add("--no-users", action="store_true", help="skip the user list pull")
     add(
+        "--attachments",
+        action="store_true",
+        help="inventory attachments and verify a sample can be fetched, then exit",
+    )
+    add(
+        "--attachment-sample",
+        type=int,
+        default=8,
+        help="how many attachments to actually retrieve (default 8)",
+    )
+    add(
         "--expand",
         default=None,
         help="'auto' for every navigation stub, or a comma-separated list. Default: none.",
@@ -1185,7 +1392,7 @@ def main() -> int:
         # --list-sets and --diagnose both stop after step 2. Labelling those runs
         # "2/4" reads as a failure two steps into four, which is how the last one
         # got reported.
-        steps = 2 if (args.list_sets or args.diagnose) else 4
+        steps = 2 if (args.list_sets or args.diagnose or args.attachments) else 4
         note(f"\n[1/{steps}] reading the service document")
         available = service.entity_sets()
         note(f"      {len(available)} collection(s), served as {service.representation or 'atom'}")
@@ -1194,6 +1401,19 @@ def main() -> int:
             note("")
             for name in sorted(available):
                 print(name)
+            footer(transport, started)
+            return 0
+
+        if args.attachments:
+            note("\nattachments")
+            survey_attachments(
+                transport,
+                service,
+                available,
+                args.out,
+                page_size=args.page_size,
+                sample=args.attachment_sample,
+            )
             footer(transport, started)
             return 0
 

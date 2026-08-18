@@ -293,3 +293,93 @@ def test_pull_users_is_skipped_when_the_list_is_absent(
     assert written is None
     assert not out.exists(), "no collection means no file, not an empty one"
     assert not responses.calls, "nothing should be requested for a collection that is not there"
+
+
+# --------------------------------------------------------------------------- #
+# attachments
+# --------------------------------------------------------------------------- #
+
+
+def test_attachment_media_url_uses_the_composite_key(pull_script: Any) -> None:
+    """AttachmentsItem is keyed on (EntitySet, ItemId, Name), not on an Id."""
+    media, direct = pull_script.attachment_urls(BASE, "Ticket", 3, "report.pdf")
+    assert media == (
+        "http://sp/_vti_bin/ListData.svc/Attachments"
+        "(EntitySet='Ticket',ItemId=3,Name='report.pdf')/$value"
+    )
+    assert direct == "http://sp/Lists/Ticket/Attachments/3/report.pdf"
+
+
+def test_attachment_url_doubles_apostrophes_in_the_odata_literal(pull_script: Any) -> None:
+    """A single quote ends an OData string literal; doubling escapes it. Without
+    this an O'Brien attachment produces a malformed key, not a 404."""
+    media, _ = pull_script.attachment_urls(BASE, "Ticket", 7, "O'Brien.pdf")
+    assert "Name='O''Brien.pdf'" in media
+
+
+def test_attachment_url_percent_encodes_spaces_and_umlauts(pull_script: Any) -> None:
+    media, direct = pull_script.attachment_urls(BASE, "Ticket", 9, "Prüfbericht Saal 2.pdf")
+    assert " " not in media and " " not in direct
+    assert "%C3%BC" in direct or "%FC" in direct
+
+
+def test_looks_like_archive_flags_containers_worth_unpacking(pull_script: Any) -> None:
+    assert pull_script.file_kind("logs.zip") == "archive"
+    assert pull_script.file_kind("bericht.PDF") == "document"
+    assert pull_script.file_kind("screenshot.png") == "image"
+    assert pull_script.file_kind("dump.log") == "text"
+    assert pull_script.file_kind("weird.xyz") == "other"
+
+
+ATTACH_URL = re.compile(r"http://sp/.*")
+
+
+@responses.activate
+def test_fetch_attachment_reports_the_form_that_worked(
+    pull_script: Any, transport: Transport, tmp_path: Path
+) -> None:
+    """Which URL form a build serves is not knowable in advance, so both are
+    tried and the working one is named."""
+    def dispatch(request: Any) -> tuple[int, dict[str, str], bytes]:
+        if "$value" in (request.url or ""):
+            return 404, {}, b""
+        return 200, {"Content-Type": "application/pdf"}, b"%PDF-1.4 hello"
+
+    responses.add_callback(responses.GET, ATTACH_URL, callback=dispatch)
+
+    result = pull_script.fetch_attachment(transport, BASE, "Ticket", 3, "report.pdf", save_to=None)
+
+    assert result["ok"] is True
+    assert result["via"] == "direct"
+    assert result["bytes"] == 14
+    assert result["content_type"] == "application/pdf"
+
+
+@responses.activate
+def test_fetch_attachment_reports_failure_of_both_forms(
+    pull_script: Any, transport: Transport
+) -> None:
+    responses.add_callback(responses.GET, ATTACH_URL, callback=lambda r: (404, {}, b""))
+
+    result = pull_script.fetch_attachment(transport, BASE, "Ticket", 3, "gone.pdf", save_to=None)
+
+    assert result["ok"] is False
+    assert result["via"] is None
+
+
+@responses.activate
+def test_fetch_attachment_saves_the_bytes_when_asked(
+    pull_script: Any, transport: Transport, tmp_path: Path
+) -> None:
+    responses.add_callback(
+        responses.GET, ATTACH_URL,
+        callback=lambda r: (200, {"Content-Type": "application/zip"}, b"PK\x03\x04payload"),
+    )
+
+    result = pull_script.fetch_attachment(
+        transport, BASE, "Ticket", 42, "logs.zip", save_to=tmp_path
+    )
+
+    saved = tmp_path / "42__logs.zip"
+    assert saved.read_bytes() == b"PK\x03\x04payload"
+    assert result["kind"] == "archive"
